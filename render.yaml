@@ -1,0 +1,31 @@
+# Render Blueprint for the free tier.
+# The web service disk is ephemeral: do not rely on the SQLite file there.
+# DATABASE_URL comes from the free Postgres database below. Unset it and the
+# app falls back to SQLite (fine on your laptop, lost on every free-tier restart).
+# Free Render Postgres expires 30 days after creation and a workspace can have
+# only one. A Neon or Supabase URL in DATABASE_URL works the same way.
+
+databases:
+  - name: lista-desejos-db
+    plan: free
+    region: oregon
+    databaseName: quero
+    user: quero
+    postgresMajorVersion: "16"
+
+services:
+  - type: web
+    name: lista-desejos-api
+    runtime: docker
+    plan: free
+    region: oregon
+    healthCheckPath: /api/health
+    envVars:
+      - key: DATABASE_URL
+        fromDatabase:
+          name: lista-desejos-db
+          property: connectionString
+      - key: CORS_ORIGINS
+        value: https://cesarwillemberg.github.io
+      - key: PYTHONUNBUFFERED
+        value: "1"
