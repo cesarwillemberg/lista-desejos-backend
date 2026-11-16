@@ -13,7 +13,11 @@ pip install -r requirements.txt
 python -m app
 ```
 
-The API listens on `http://127.0.0.1:47231`.
+The API listens on `http://127.0.0.1:47231`. Set a JWT secret before starting (at least 16 characters):
+
+```bash
+export JWT_SECRET=dev-only-change-me-please
+```
 
 | Variable | Default | |
 | --- | --- | --- |
@@ -22,6 +26,7 @@ The API listens on `http://127.0.0.1:47231`.
 | `QUERO_DB` | `data/wishlist.db` | SQLite file |
 | `QUERO_WEB_DIR` | `../frontend/build/web` when that folder exists | Optional Flutter web build served on `/` |
 | `DATABASE_URL` | unset | Postgres URL (`postgres://` or `postgresql://`). When set, SQLite is not used |
+| `JWT_SECRET` | required | Signs login tokens. At least 16 characters. On Render, `render.yaml` generates it |
 | `CORS_ORIGINS` | `https://cesarwillemberg.github.io` | Comma-separated browser origins. Localhost is always allowed |
 
 ```bash
@@ -29,17 +34,19 @@ pytest
 python scripts/live_report.py
 ```
 
+Accounts, lists, and items are created by Alembic (`alembic upgrade head` runs on startup). If this database still has the old single `items` table, those rows move into **Minha lista** for the first account that signs up. A brand-new Postgres database starts empty. The free Render disk does not keep SQLite across restarts, so production must set `DATABASE_URL`.
+
 ## API
 
-- `GET /api/items` — list, totals by currency, count of items without a price
-- `POST /api/items` — `{ "name", "url" }`. The item is saved even when the page cannot be read
-- `PATCH /api/items/{id}` — `name`, `image_url`, `price`, `currency` (send `null` or `""` to clear image or price)
-- `POST /api/items/{id}/refresh` — fetch again. A failed refresh keeps the previous photo and price
-- `DELETE /api/items/{id}`
-- `GET /api/items/{id}/image` — proxies the product image so the browser is not blocked by hotlink rules
+- `POST /api/auth/register` and `POST /api/auth/login` — `{ "email", "password" }` returns a JWT (30 days). Send `Authorization: Bearer …`
+- `GET /api/auth/me`
+- `GET/POST /api/lists`, `PATCH/DELETE /api/lists/{id}`
+- `POST /api/lists/{id}/share`, `POST …/share/regenerate`, `DELETE …/share`
+- `GET /api/share/{token}` — public read-only list. `POST/DELETE …/items/{id}/reservation` marks “Já comprei”
+- `GET/POST /api/lists/{id}/items`, plus `PATCH /api/items/{id}`, refresh, delete, and the image proxy
 - `GET /api/health`
 
-Prices are numbers. `BRL` is formatted by the app as `R$ 1.299,90`. Other ISO currencies are left as returned by the page.
+Prices are numbers. `BRL` is formatted by the app as `R$ 1.299,90`. Other ISO currencies are left as returned by the page. The item is saved even when the store page cannot be read. A failed refresh keeps the previous photo and price.
 
 ## How image and price are read
 
@@ -67,6 +74,18 @@ Live fetches from this environment:
 | Mercado Livre | [Kindle Paperwhite, MLB25909879](https://www.mercadolivre.com.br/amazon-kindle-paperwhite-11th-genera-68-16-gb-sem-anuncios-cor-preta/p/MLB25909879) | **Not read.** The response is the account-verification wall (`/gz/account-verification`), not the product. Same graceful save. |
 
 `pytest` covers the JSON-LD, Open Graph, microdata, Amazon buy box, Mercado Livre andes classes, and `__NEXT_DATA__` shapes without calling the stores. Those parsers are ready for Magazine Luiza and Mercado Livre when the HTML is actually the product page (a residential network often gets it; this datacenter IP does not).
+
+## Env vars on the existing Render service
+
+The service already live is `https://lista-desejos-backend.onrender.com`. Set these there and redeploy; do not create a second web service.
+
+| Variable | Value |
+| --- | --- |
+| `DATABASE_URL` | Internal URL of a Postgres database. `render.yaml` wires a free database named `lista-desejos-db`. Free Render Postgres expires 30 days after creation. A Neon or Supabase URL works the same way |
+| `JWT_SECRET` | Long random string, at least 16 characters. `render.yaml` uses `generateValue: true` so a new Blueprint creates one and keeps it. If the service already exists, paste one yourself |
+| `CORS_ORIGINS` | `https://cesarwillemberg.github.io` |
+
+`PORT` is set by Render. Leave `QUERO_DB` unset in production.
 
 ## Deploy on Render (free)
 

@@ -1,6 +1,7 @@
 import os
 
 os.environ["QUERO_DISABLE_WEB"] = "1"
+os.environ.setdefault("JWT_SECRET", "test-secret-please-change")
 
 import pytest
 from fastapi.testclient import TestClient

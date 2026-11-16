@@ -45,6 +45,30 @@ def engine_name() -> str:
     return "postgres" if database_url() else "sqlite"
 
 
+def sqlalchemy_url() -> str:
+    url = database_url()
+    if url:
+        if url.startswith("postgres://"):
+            return "postgresql+psycopg://" + url[len("postgres://") :]
+        if url.startswith("postgresql://"):
+            return "postgresql+psycopg://" + url[len("postgresql://") :]
+        return url
+    path = db_path().resolve()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    return "sqlite:///" + path.as_posix()
+
+
+def migrate() -> None:
+    from alembic import command
+    from alembic.config import Config
+
+    root = Path(__file__).resolve().parents[1]
+    cfg = Config(str(root / "alembic.ini"))
+    cfg.set_main_option("script_location", str(root / "alembic"))
+    cfg.set_main_option("sqlalchemy.url", sqlalchemy_url())
+    command.upgrade(cfg, "head")
+
+
 def db_path() -> Path:
     configured = os.environ.get("QUERO_DB")
     if configured:
@@ -90,6 +114,7 @@ def connect() -> _Conn:
     raw = sqlite3.connect(path, timeout=15)
     raw.row_factory = sqlite3.Row
     raw.execute("PRAGMA journal_mode=WAL")
+    raw.execute("PRAGMA foreign_keys=ON")
     return _Conn(raw, postgres=False)
 
 
@@ -108,9 +133,47 @@ def _money(value):
     return round(float(value), 2)
 
 
+def _count(row) -> int:
+    if row is None:
+        return 0
+    if isinstance(row, dict):
+        return int(next(iter(row.values())))
+    try:
+        return int(row["n"])
+    except (KeyError, TypeError, IndexError):
+        return int(row[0])
+
+
+def row_to_user(row) -> dict:
+    return {"id": row["id"], "email": row["email"], "created_at": row["created_at"]}
+
+
+def row_to_list(row, items: list[dict] | None = None) -> dict:
+    priced = [item for item in (items or []) if item["price"] is not None]
+    buckets: dict[str, float] = {}
+    for item in priced:
+        code = item["currency"] or ""
+        buckets[code] = buckets.get(code, 0.0) + float(item["price"])
+    totals = [
+        {"currency": key or None, "amount": round(value, 2)}
+        for key, value in sorted(buckets.items(), key=lambda pair: (pair[0] != "BRL", pair[0] == "", pair[0]))
+    ]
+    return {
+        "id": row["id"],
+        "name": row["name"],
+        "share_token": row["share_token"],
+        "item_count": len(items or []),
+        "unpriced_count": sum(1 for item in (items or []) if item["price"] is None),
+        "totals": totals,
+        "created_at": row["created_at"],
+        "updated_at": row["updated_at"],
+    }
+
+
 def row_to_item(row) -> dict:
     return {
         "id": row["id"],
+        "list_id": row["list_id"],
         "name": row["name"],
         "url": row["url"],
         "image_url": row["image_url"],
@@ -121,14 +184,209 @@ def row_to_item(row) -> dict:
         "message": row["message"],
         "image_source": row["image_source"],
         "price_source": row["price_source"],
+        "reserved": bool(row["reserved_at"]),
+        "reserved_label": row["reserved_label"],
+        "reserved_token_hash": row["reserved_token_hash"],
+        "reserved_at": row["reserved_at"],
         "created_at": row["created_at"],
         "updated_at": row["updated_at"],
     }
 
 
-def list_items() -> list[dict]:
+def public_item(item: dict, *, mine: bool) -> dict:
+    data = {key: value for key, value in item.items() if key not in {"reserved_token_hash", "reserved_label"}}
+    data["reserved_by_me"] = mine
+    return data
+
+
+def get_user(user_id: str) -> dict | None:
     with _lock, connect() as conn:
-        rows = conn.execute("SELECT * FROM items ORDER BY created_at DESC").fetchall()
+        row = conn.execute("SELECT id, email, created_at FROM users WHERE id = ?", (user_id,)).fetchone()
+    return row_to_user(row) if row else None
+
+
+def get_user_by_email(email: str) -> dict | None:
+    with _lock, connect() as conn:
+        row = conn.execute("SELECT id, email, password_hash, created_at FROM users WHERE email = ?", (email,)).fetchone()
+    if row is None:
+        return None
+    user = row_to_user(row)
+    user["password_hash"] = row["password_hash"]
+    return user
+
+
+def register_user(email: str, password_hash: str) -> dict:
+    now = utc_now()
+    user_id = str(uuid4())
+    list_id = str(uuid4())
+    with _lock, connect() as conn:
+        exists = conn.execute("SELECT id FROM users WHERE email = ?", (email,)).fetchone()
+        if exists:
+            raise ValueError("Este e-mail já tem uma conta.")
+        conn.execute(
+            "INSERT INTO users (id, email, password_hash, created_at) VALUES (?, ?, ?, ?)",
+            (user_id, email, password_hash, now),
+        )
+        conn.execute(
+            "INSERT INTO lists (id, user_id, name, share_token, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
+            (list_id, user_id, "Minha lista", None, now, now),
+        )
+        count = _count(conn.execute("SELECT COUNT(*) AS n FROM users").fetchone())
+        if count == 1:
+            _adopt_legacy(conn, list_id, now)
+    user = get_user(user_id)
+    assert user is not None
+    return user
+
+
+def _table_exists(conn: _Conn, name: str) -> bool:
+    if conn._postgres:
+        row = conn.execute(
+            "SELECT 1 FROM information_schema.tables WHERE table_schema = 'public' AND table_name = ?",
+            (name,),
+        ).fetchone()
+    else:
+        row = conn.execute("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?", (name,)).fetchone()
+    return row is not None
+
+
+def _adopt_legacy(conn: _Conn, list_id: str, now: str) -> None:
+    if not _table_exists(conn, "legacy_items"):
+        return
+    rows = conn.execute("SELECT * FROM legacy_items").fetchall()
+    for row in rows:
+        data = dict(row)
+        conn.execute(
+            """
+            INSERT INTO items (
+              id, list_id, name, url, image_url, price, currency, store, status, message,
+              image_source, price_source, reserved_label, reserved_token_hash, reserved_at,
+              created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                data.get("id") or str(uuid4()),
+                list_id,
+                data.get("name") or "Item",
+                data.get("url") or "https://example.invalid",
+                data.get("image_url"),
+                data.get("price"),
+                data.get("currency"),
+                data.get("store"),
+                data.get("status") or "failed",
+                data.get("message"),
+                data.get("image_source"),
+                data.get("price_source"),
+                None,
+                None,
+                None,
+                data.get("created_at") or now,
+                data.get("updated_at") or now,
+            ),
+        )
+    if conn._postgres:
+        conn.execute("DROP TABLE legacy_items")
+    else:
+        conn.execute("DROP TABLE legacy_items")
+
+
+def lists_for_user(user_id: str) -> list[dict]:
+    with _lock, connect() as conn:
+        rows = conn.execute(
+            "SELECT * FROM lists WHERE user_id = ? ORDER BY updated_at DESC",
+            (user_id,),
+        ).fetchall()
+        result = []
+        for row in rows:
+            items = [
+                row_to_item(item)
+                for item in conn.execute(
+                    "SELECT * FROM items WHERE list_id = ? ORDER BY created_at DESC",
+                    (row["id"],),
+                ).fetchall()
+            ]
+            result.append(row_to_list(row, items))
+    return result
+
+
+def get_owned_list(list_id: str, user_id: str) -> dict | None:
+    with _lock, connect() as conn:
+        row = conn.execute("SELECT * FROM lists WHERE id = ? AND user_id = ?", (list_id, user_id)).fetchone()
+        if row is None:
+            return None
+        items = [
+            row_to_item(item)
+            for item in conn.execute("SELECT * FROM items WHERE list_id = ?", (list_id,)).fetchall()
+        ]
+    return row_to_list(row, items)
+
+
+def create_list(user_id: str, name: str) -> dict:
+    now = utc_now()
+    list_id = str(uuid4())
+    with _lock, connect() as conn:
+        conn.execute(
+            "INSERT INTO lists (id, user_id, name, share_token, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
+            (list_id, user_id, name, None, now, now),
+        )
+    found = get_owned_list(list_id, user_id)
+    assert found is not None
+    return found
+
+
+def rename_list(list_id: str, user_id: str, name: str) -> dict | None:
+    now = utc_now()
+    with _lock, connect() as conn:
+        cursor = conn.execute(
+            "UPDATE lists SET name = ?, updated_at = ? WHERE id = ? AND user_id = ?",
+            (name, now, list_id, user_id),
+        )
+        if cursor.rowcount == 0:
+            return None
+    return get_owned_list(list_id, user_id)
+
+
+def delete_list(list_id: str, user_id: str) -> bool:
+    with _lock, connect() as conn:
+        cursor = conn.execute("DELETE FROM lists WHERE id = ? AND user_id = ?", (list_id, user_id))
+        return cursor.rowcount > 0
+
+
+def set_share_token(list_id: str, user_id: str, token: str | None) -> dict | None:
+    now = utc_now()
+    with _lock, connect() as conn:
+        cursor = conn.execute(
+            "UPDATE lists SET share_token = ?, updated_at = ? WHERE id = ? AND user_id = ?",
+            (token, now, list_id, user_id),
+        )
+        if cursor.rowcount == 0:
+            return None
+    return get_owned_list(list_id, user_id)
+
+
+def get_list_by_share_token(token: str) -> dict | None:
+    with _lock, connect() as conn:
+        row = conn.execute("SELECT * FROM lists WHERE share_token = ?", (token,)).fetchone()
+        if row is None:
+            return None
+        items = [
+            row_to_item(item)
+            for item in conn.execute(
+                "SELECT * FROM items WHERE list_id = ? ORDER BY created_at DESC",
+                (row["id"],),
+            ).fetchall()
+        ]
+    payload = row_to_list(row, items)
+    payload["items"] = items
+    return payload
+
+
+def list_items(list_id: str) -> list[dict]:
+    with _lock, connect() as conn:
+        rows = conn.execute(
+            "SELECT * FROM items WHERE list_id = ? ORDER BY created_at DESC",
+            (list_id,),
+        ).fetchall()
     return [row_to_item(row) for row in rows]
 
 
@@ -138,19 +396,34 @@ def get_item(item_id: str) -> dict | None:
     return row_to_item(row) if row else None
 
 
-def insert_item(fields: dict) -> dict:
+def user_owns_item(user_id: str, item_id: str) -> dict | None:
+    with _lock, connect() as conn:
+        row = conn.execute(
+            """
+            SELECT items.* FROM items
+            JOIN lists ON lists.id = items.list_id
+            WHERE items.id = ? AND lists.user_id = ?
+            """,
+            (item_id, user_id),
+        ).fetchone()
+    return row_to_item(row) if row else None
+
+
+def insert_item(list_id: str, fields: dict) -> dict:
     now = utc_now()
     item_id = str(uuid4())
     with _lock, connect() as conn:
         conn.execute(
             """
             INSERT INTO items (
-              id, name, url, image_url, price, currency, store, status, message,
-              image_source, price_source, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+              id, list_id, name, url, image_url, price, currency, store, status, message,
+              image_source, price_source, reserved_label, reserved_token_hash, reserved_at,
+              created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 item_id,
+                list_id,
                 fields["name"],
                 fields["url"],
                 fields.get("image_url"),
@@ -161,10 +434,14 @@ def insert_item(fields: dict) -> dict:
                 fields.get("message"),
                 fields.get("image_source"),
                 fields.get("price_source"),
+                None,
+                None,
+                None,
                 now,
                 now,
             ),
         )
+        conn.execute("UPDATE lists SET updated_at = ? WHERE id = ?", (now, list_id))
     item = get_item(item_id)
     assert item is not None
     return item
@@ -185,6 +462,9 @@ def update_item(item_id: str, fields: dict) -> dict | None:
         "message",
         "image_source",
         "price_source",
+        "reserved_label",
+        "reserved_token_hash",
+        "reserved_at",
     }
     changes = {key: value for key, value in fields.items() if key in allowed}
     if not changes:
@@ -200,6 +480,10 @@ def update_item(item_id: str, fields: dict) -> dict | None:
 
 
 def delete_item(item_id: str) -> bool:
+    current = get_item(item_id)
+    if current is None:
+        return False
     with _lock, connect() as conn:
         cursor = conn.execute("DELETE FROM items WHERE id = ?", (item_id,))
+        conn.execute("UPDATE lists SET updated_at = ? WHERE id = ?", (utc_now(), current["list_id"]))
         return cursor.rowcount > 0
