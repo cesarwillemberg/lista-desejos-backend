@@ -20,6 +20,10 @@ services:
     plan: free
     region: oregon
     healthCheckPath: /api/health
+    # Runs in the built image before the new instance takes traffic.
+    # Startup still migrates unless WISHLY_MIGRATE=0, and skips in one
+    # query when the database is already at head.
+    preDeployCommand: alembic upgrade head
     envVars:
       - key: DATABASE_URL
         fromDatabase:

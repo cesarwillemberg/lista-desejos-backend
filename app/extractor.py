@@ -13,6 +13,7 @@ Layers, in order, fill only the fields still empty:
 from __future__ import annotations
 
 import json
+import logging
 import re
 from dataclasses import dataclass, field
 from urllib.parse import urljoin, urlparse
@@ -20,6 +21,10 @@ from urllib.parse import urljoin, urlparse
 from bs4 import BeautifulSoup
 
 from app.fetch import FetchResult, fetch_html
+
+logger = logging.getLogger("wishly.extract")
+
+BLOCKED_MESSAGE = "Essa loja bloqueia a busca automática; edite o preço manualmente"
 
 _TYPE_SPLIT = re.compile(r"[/#:]")
 
@@ -107,14 +112,20 @@ def _from_fetch(fetched: FetchResult) -> Extracted:
         )
     draft = _Draft(base=final_url)
     soup = BeautifulSoup(fetched.html, "lxml")
-    _apply_extruct(fetched.html, final_url, draft)
-    _apply_jsonld_scripts(soup, draft)
-    _apply_meta(soup, draft)
-    _apply_amazon(soup, draft)
-    _apply_mercadolivre(soup, draft)
-    _apply_embedded_json(soup, draft)
-    _apply_visible_price(soup, draft)
-    _apply_generic_image(soup, draft)
+    for step in (
+        lambda: _apply_extruct(fetched.html, final_url, draft),
+        lambda: _apply_jsonld_scripts(soup, draft),
+        lambda: _apply_meta(soup, draft),
+        lambda: _apply_amazon(soup, draft),
+        lambda: _apply_mercadolivre(soup, draft),
+        lambda: _apply_embedded_json(soup, draft),
+        lambda: _apply_visible_price(soup, draft),
+        lambda: _apply_generic_image(soup, draft),
+    ):
+        try:
+            step()
+        except Exception:
+            logger.exception("product parser step failed for %s", final_url)
     return _finish(draft, fetched, soup)
 
 
@@ -219,6 +230,10 @@ def _number_from_token(token: str, *, br_text: bool) -> float | None:
 
 
 def _finish(draft: _Draft, fetched: FetchResult, soup: BeautifulSoup) -> Extracted:
+    if draft.price is not None and not draft.currency:
+        host = (urlparse(draft.base).hostname or "").lower()
+        if host.endswith(".br"):
+            draft.currency = "BRL"
     if draft.image is None and draft.price is None:
         message = _block_message(soup, fetched) or fetched.error or "Não encontramos foto nem preço nessa página."
         status = "failed"
@@ -252,14 +267,23 @@ def _block_message(soup: BeautifulSoup, fetched: FetchResult) -> str | None:
     title = soup.title.get_text(" ", strip=True).lower() if soup.title else ""
     if "account-verification" in final or "suspicious-traffic" in html or "gz-account-verification" in html:
         return "O Mercado Livre pediu uma verificação de acesso e não entregou a página do produto."
-    if "não é possível acessar" in title or "nao e possivel acessar" in title:
-        if "magalu" in html or "magazine luiza" in html or "magazineluiza" in final:
-            return "A Magazine Luiza recusou o acesso automático (erro 403)."
-        return "A loja recusou o acesso automático a esta página."
-    if fetched.status in {403, 429, 503} and "amazon." in final:
+    blocked = fetched.status in {401, 403, 429} or any(
+        token in html or token in title
+        for token in (
+            "akamai",
+            "access denied",
+            "edgesuite",
+            "não é possível acessar",
+            "nao e possivel acessar",
+            "validatecaptcha",
+            "robot check",
+            "pardon our interruption",
+        )
+    )
+    if blocked:
+        return BLOCKED_MESSAGE
+    if fetched.status in {503} and "amazon." in final:
         return "A Amazon não entregou a página do produto."
-    if "validatecaptcha" in html or "robot check" in title:
-        return "A loja exibiu uma verificação anti-robô em vez do produto."
     if fetched.status and fetched.status >= 400:
         return f"A loja respondeu com o erro {fetched.status}."
     return None
@@ -305,7 +329,7 @@ def _apply_jsonld_node(node, draft: _Draft) -> None:
         price, currency = _price_from_offer(offer)
         if price is None:
             continue
-        draft.set_price(price, "json-ld", currency)
+        draft.set_price(price, "json-ld", currency, br_text=isinstance(price, str))
         if draft.price is not None:
             break
 
@@ -464,12 +488,13 @@ def _apply_embedded_json(soup: BeautifulSoup, draft: _Draft) -> None:
             continue
         found = _best_embedded(payload)
         if found and (best is None or found[0] > best[0]):
-            best = (found[0], source, found[1], found[2], found[3])
+            best = (found[0], source, found[1], found[2], found[3], found[4])
     if not best:
         return
-    _, source, price, currency, image = best
+    _, source, price, currency, image, title = best
     draft.set_price(price, source, currency, br_text=isinstance(price, str))
     draft.set_image(image, source)
+    draft.set_title(title if isinstance(title, str) else None, source)
 
 
 def _apply_visible_price(soup: BeautifulSoup, draft: _Draft) -> None:
@@ -512,8 +537,9 @@ def _best_embedded(payload) -> tuple | None:
             joined = "/".join(path).lower()
             if any(word in joined for word in ("recommend", "related", "breadcrumb", "review", "advert", "freight", "shipping")):
                 score -= 6
+            title = node.get("name") or node.get("title") or node.get("productName")
             if score >= 7 and (best is None or score > best[0]):
-                best = (score, price, currency, image)
+                best = (score, price, currency, image, title)
             for key, value in node.items():
                 walk(value, path + (str(key),))
         elif isinstance(node, list):
@@ -533,16 +559,21 @@ def _score_embedded(node: dict) -> tuple:
         score += 4
     if image:
         score += 3
-    if node.get("name") or node.get("title"):
+    if node.get("name") or node.get("title") or node.get("productName"):
         score += 1
     if "Product" in types:
         score += 4
-    if price is None or not (image or "Product" in types):
+    if price is None or not (image or "Product" in types or node.get("prices")):
         return 0, None, None, None
     return score, price, currency, image
 
 
 def _price_from_mapping(node: dict) -> tuple:
+    nested = node.get("prices")
+    if isinstance(nested, dict):
+        nested_price, nested_currency = _price_from_mapping(nested)
+        if nested_price is not None:
+            return nested_price, nested_currency or node.get("priceCurrency") or node.get("currency")
     for key in (
         "priceWithDiscount",
         "salePrice",
@@ -585,8 +616,15 @@ def _offers(product: dict):
     else:
         nodes = []
     for node in nodes:
-        if isinstance(node, dict):
-            yield node
+        if not isinstance(node, dict):
+            continue
+        yield node
+        nested = node.get("offers")
+        if nested and "AggregateOffer" in _types(node):
+            children = nested if isinstance(nested, list) else [nested]
+            for child in children:
+                if isinstance(child, dict):
+                    yield child
 
 
 def _price_from_offer(offer: dict) -> tuple:

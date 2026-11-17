@@ -7,9 +7,11 @@ product page to the impersonated client. httpx remains the fallback.
 
 from __future__ import annotations
 
+import gzip
 import ipaddress
 import logging
 import socket
+import zlib
 from dataclasses import dataclass
 from urllib.parse import urlparse
 
@@ -38,6 +40,18 @@ BROWSER_HEADERS = {
     "Sec-Fetch-Site": "none",
     "Sec-Fetch-User": "?1",
 }
+
+
+def accept_encoding() -> str:
+    """Advertise brotli only when the decoder is installed."""
+    try:
+        import brotli  # noqa: F401
+    except ImportError:
+        return "gzip, deflate"
+    return "gzip, deflate, br"
+
+
+BROWSER_HEADERS["Accept-Encoding"] = accept_encoding()
 
 MAX_HTML_CHARS = 3_000_000
 MAX_IMAGE_BYTES = 5_000_000
@@ -84,24 +98,41 @@ def ensure_public_url(url: str) -> str:
     return url.strip()
 
 
-def fetch_html(url: str, timeout: float = 20.0) -> FetchResult:
+def _worth_keeping(result: FetchResult | None) -> bool:
+    return bool(result and result.status and result.status < 400 and len(result.html or "") > 800)
+
+
+def fetch_html(url: str, timeout: float = 10.0) -> FetchResult:
     ensure_public_url(url)
+    primary: FetchResult | None = None
     try:
-        return _with_curl(url, timeout)
+        primary = _with_curl(url, timeout)
     except ValueError:
         raise
     except TimeoutError:
-        return FetchResult(False, url, url, None, "", "A página demorou demais para responder.", None)
+        primary = FetchResult(False, url, url, None, "", "A página demorou demais para responder.", "curl_cffi")
     except Exception:
-        pass
+        logger.info("curl_cffi could not fetch %s", url)
+    if _worth_keeping(primary):
+        return primary
     try:
-        return _with_httpx(url, timeout)
+        secondary = _with_httpx(url, timeout)
     except ValueError:
         raise
     except TimeoutError:
+        if primary is not None:
+            return primary
         return FetchResult(False, url, url, None, "", "A página demorou demais para responder.", "httpx")
     except Exception:
-        return FetchResult(False, url, url, None, "", "Não foi possível acessar a página da loja.", None)
+        logger.info("httpx could not fetch %s", url)
+        secondary = None
+    if _worth_keeping(secondary):
+        return secondary
+    if primary is not None and (secondary is None or (primary.status or 999) <= (secondary.status or 999)):
+        return primary
+    if secondary is not None:
+        return secondary
+    return FetchResult(False, url, url, None, "", "Não foi possível acessar a página da loja.", None)
 
 
 def fetch_image(url: str, referer: str | None, timeout: float = 15.0) -> tuple[bytes, str]:
@@ -135,32 +166,59 @@ def _with_curl(url: str, timeout: float) -> FetchResult:
             impersonate="chrome131",
             timeout=timeout,
             allow_redirects=True,
-            headers={"Accept-Language": "pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7"},
+            headers=BROWSER_HEADERS,
         )
     except Exception as exc:
         if "timeout" in type(exc).__name__.lower() or "timed out" in str(exc).lower():
             raise TimeoutError(str(exc)) from exc
         raise
-    return _result_from_response(url, str(response.url), response.status_code, response.headers, response.text, "curl_cffi")
+    return _result_from_response(url, str(response.url), response.status_code, response.headers, response.content, "curl_cffi")
 
 
 def _with_httpx(url: str, timeout: float) -> FetchResult:
     try:
-        with httpx.Client(follow_redirects=True, timeout=timeout, headers=BROWSER_HEADERS) as client:
+        with httpx.Client(follow_redirects=True, timeout=timeout, headers=BROWSER_HEADERS, http2=True) as client:
             response = client.get(url)
     except httpx.TimeoutException as exc:
         raise TimeoutError(str(exc)) from exc
-    return _result_from_response(url, str(response.url), response.status_code, response.headers, response.text, "httpx")
+    return _result_from_response(url, str(response.url), response.status_code, response.headers, response.content, "httpx")
 
 
-def _result_from_response(url, final_url, status, headers, text, via) -> FetchResult:
+def decode_body(content: bytes, content_encoding: str | None = None, charset: str | None = None) -> str:
+    """Turn a response body into HTML, including gzip and brotli left compressed."""
+    raw = content or b""
+    encoding = (content_encoding or "").lower()
+    if raw.startswith(b"\x1f\x8b"):
+        raw = gzip.decompress(raw)
+    elif "br" in {part.strip() for part in encoding.split(",")} and raw[:1] not in {b"<", b" ", b"\n", b"\r", b"\t"}:
+        try:
+            import brotli
+        except ImportError:
+            brotli = None
+        if brotli is not None:
+            try:
+                raw = brotli.decompress(raw)
+            except Exception:
+                logger.warning("brotli body could not be decoded")
+    elif "deflate" in encoding or raw.startswith(b"\x78"):
+        try:
+            raw = zlib.decompress(raw)
+        except zlib.error:
+            pass
+    text_encoding = charset or "utf-8"
+    if text_encoding in {"iso-8859-1", "latin-1"} and raw.startswith((b"<", b"\xef\xbb\xbf")):
+        text_encoding = "utf-8"
+    return raw.decode(text_encoding, errors="replace")
+
+
+def _result_from_response(url, final_url, status, headers, content, via) -> FetchResult:
     ensure_public_url(final_url)
     ctype = ""
     if headers is not None:
         getter = getattr(headers, "get", None)
         ctype = (getter("content-type") or "") if getter else ""
     ctype = ctype.lower()
-    if ctype and not any(token in ctype for token in ("html", "xml", "json", "text/")):
+    if ctype and not any(token in ctype for token in ("html", "xml", "json", "text/", "octet-stream")):
         return FetchResult(
             True,
             url,
@@ -170,7 +228,18 @@ def _result_from_response(url, final_url, status, headers, text, via) -> FetchRe
             "Esse link não parece uma página de produto.",
             via,
         )
-    html = text or ""
+    if isinstance(content, str):
+        html = content
+    else:
+        encoding = ""
+        charset = None
+        if headers is not None:
+            getter = getattr(headers, "get", None)
+            if getter:
+                encoding = getter("content-encoding") or ""
+                if "charset=" in ctype:
+                    charset = ctype.split("charset=", 1)[1].split(";", 1)[0].strip()
+        html = decode_body(content or b"", encoding, charset)
     if len(html) > MAX_HTML_CHARS:
         html = html[:MAX_HTML_CHARS]
     return FetchResult(True, url, final_url, status, html, None, via)

@@ -18,6 +18,14 @@ def _ok(url="https://www.kabum.com.br/produto/1"):
     )
 
 
+def _saved(client, headers, list_id, item_id):
+    listed = client.get(f"/api/lists/{list_id}/items", headers=headers).json()
+    for item in listed["items"]:
+        if item["id"] == item_id:
+            return item
+    raise AssertionError(item_id)
+
+
 def _auth(client, email="ana@example.com", password="senha-forte"):
     response = client.post("/api/auth/register", json={"email": email, "password": password})
     assert response.status_code == 201, response.text
@@ -63,8 +71,11 @@ def test_lists_items_are_private_to_the_owner(client, monkeypatch):
     )
     assert item.status_code == 201
     body = item.json()
-    assert body["price"] == 6196.39
+    assert body["status"] == "pending"
     assert body["store"] == "KaBuM!"
+    body = _saved(client, ana, list_id, body["id"])
+    assert body["price"] == 6196.39
+    assert body["status"] == "ok"
     listed = client.get(f"/api/lists/{list_id}/items", headers=ana).json()
     assert listed["totals"] == [{"currency": "BRL", "amount": 6196.39}]
     assert client.delete(f"/api/lists/{list_id}", headers=bia).status_code == 404
@@ -231,8 +242,10 @@ def test_refresh_keeps_previous_when_fetch_fails(client, monkeypatch):
     )
     refreshed = client.post(f"/api/items/{item['id']}/refresh", headers=headers)
     assert refreshed.status_code == 200
-    assert refreshed.json()["price"] == 6196.39
-    assert "Mantivemos" in refreshed.json()["message"]
+    assert refreshed.json()["status"] == "pending"
+    settled = _saved(client, headers, list_id, item["id"])
+    assert settled["price"] == 6196.39
+    assert "Mantivemos" in settled["message"]
 
 
 def test_rate_limit_blocks_repeated_login(client):
@@ -240,14 +253,16 @@ def test_rate_limit_blocks_repeated_login(client):
 
     auth_limiter.limit = 2
     auth_limiter.reset()
-    payload = {"email": "limite@example.com", "password": "senha-forte"}
-    assert client.post("/api/auth/register", json=payload).status_code == 201
-    assert client.post("/api/auth/login", json=payload).status_code == 200
-    blocked = client.post("/api/auth/login", json=payload)
-    assert blocked.status_code == 429
-    assert "minuto" in blocked.json()["detail"]
-    auth_limiter.limit = 10000
-    auth_limiter.reset()
+    try:
+        payload = {"email": "limite@example.com", "password": "senha-forte"}
+        assert client.post("/api/auth/register", json=payload).status_code == 201
+        assert client.post("/api/auth/login", json=payload).status_code == 200
+        blocked = client.post("/api/auth/login", json=payload)
+        assert blocked.status_code == 429
+        assert "minuto" in blocked.json()["detail"]
+    finally:
+        auth_limiter.limit = 10000
+        auth_limiter.reset()
 
 
 def test_scraper_rejects_private_and_non_http(client):
@@ -550,3 +565,104 @@ def test_collaboration_roles_invites_and_viewer_cannot_write(client, monkeypatch
     assert client.post(f"/api/lists/{list_id}/leave", headers=bia).status_code == 204
     assert client.get(f"/api/lists/{list_id}/items", headers=bia).status_code == 404
     assert client.get(f"/api/lists/{list_id}/items", headers=ana).status_code == 200
+
+
+def test_changing_the_link_replaces_store_and_price(client, monkeypatch):
+    def fake(url):
+        if "amazon." in url:
+            return Extracted(
+                image_url="https://m.media-amazon.com/images/I/echo.jpg",
+                price=199.0,
+                currency="BRL",
+                title="Echo Dot",
+                status="ok",
+                image_source="json-ld",
+                price_source="json-ld",
+                final_url=url,
+            )
+        return _ok(url)
+
+    monkeypatch.setattr("app.main.extract_product", fake)
+    headers, _user = _auth(client, "link@example.com")
+    list_id = client.get("/api/lists", headers=headers).json()["lists"][0]["id"]
+    created = client.post(
+        f"/api/lists/{list_id}/items",
+        json={"name": "PS5", "url": "https://www.kabum.com.br/produto/953110"},
+        headers=headers,
+    )
+    assert created.status_code == 201
+    item_id = created.json()["id"]
+    original = _saved(client, headers, list_id, item_id)
+    assert original["store"] == "KaBuM!"
+    assert original["price"] == 6196.39
+    edited = client.patch(
+        f"/api/items/{item_id}",
+        json={
+            "name": "PS5",
+            "url": "https://www.amazon.com.br/dp/B09B8XVSDP",
+            "price": 6196.39,
+            "image_url": original["image_url"],
+            "currency": "BRL",
+        },
+        headers=headers,
+    )
+    assert edited.status_code == 200
+    assert edited.json()["status"] == "pending"
+    assert edited.json()["store"] == "Amazon"
+    assert edited.json()["price"] is None
+    settled = _saved(client, headers, list_id, item_id)
+    assert settled["store"] == "Amazon"
+    assert settled["price"] == 199.0
+    assert settled["name"] == "Echo Dot"
+    assert "amazon" in (settled["image_url"] or "")
+    assert settled["status"] == "ok"
+
+
+def test_health_can_time_the_database(client):
+    response = client.get("/api/health?db=1")
+    assert response.status_code == 200
+    body = response.json()
+    assert body["ok"] is True
+    assert body["database"] == "sqlite"
+    assert body["db_ms"] >= 0
+
+
+def test_list_reads_use_one_connection(client, monkeypatch):
+    monkeypatch.setattr("app.main.extract_product", lambda url: _ok(url))
+    headers, _user = _auth(client, "pool@example.com")
+    list_id = client.get("/api/lists", headers=headers).json()["lists"][0]["id"]
+    client.post(
+        f"/api/lists/{list_id}/items",
+        json={"name": "PS5", "url": "https://www.kabum.com.br/produto/953110"},
+        headers=headers,
+    )
+    from app import db
+
+    db.checkouts = 0
+    items = client.get(f"/api/lists/{list_id}/items", headers=headers)
+    assert items.status_code == 200
+    assert items.json()["totals"] == [{"currency": "BRL", "amount": 6196.39}]
+    assert db.checkouts == 1
+    db.checkouts = 0
+    listed = client.get("/api/lists", headers=headers)
+    assert listed.status_code == 200
+    assert listed.json()["lists"][0]["item_count"] == 1
+    assert db.checkouts == 1
+
+
+def test_login_rehashes_an_old_password(client):
+    from argon2 import PasswordHasher
+
+    headers, user = _auth(client, "rehash@example.com")
+    old = PasswordHasher(time_cost=3, memory_cost=65536, parallelism=1)
+    from app import db
+
+    db.set_password_hash(user["id"], old.hash("senha-forte"))
+    logged = client.post("/api/auth/login", json={"email": "rehash@example.com", "password": "senha-forte"})
+    assert logged.status_code == 200
+    stored = db.get_user_by_email("rehash@example.com")
+    assert stored is not None
+    from app.auth import password_needs_rehash
+
+    assert password_needs_rehash(stored["password_hash"]) is False
+    assert client.get("/api/auth/me", headers=headers).status_code == 200

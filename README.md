@@ -35,13 +35,19 @@ export JWT_SECRET=dev-only-change-me-please
 | `CORS_ORIGINS` | `https://cesarwillemberg.github.io` | Comma-separated browser origins. Localhost is always allowed |
 | `WISHLY_AUTH_RATE` | `20` | Logins and sign-ups allowed per IP each minute. `0` turns the limit off |
 | `WISHLY_SCRAPE_RATE` | `30` | Product reads allowed per IP each minute |
+| `WISHLY_DB_POOL_MIN` | `1` | Postgres pool size. Ignored for SQLite |
+| `WISHLY_DB_POOL_MAX` | `6` | Postgres pool size. A Neon `-pooler` host in `DATABASE_URL` is used as-is; prepared statements stay off so transaction-mode pooling works |
+| `WISHLY_MIGRATE` | `1` | `0` skips `alembic upgrade` on startup. Leave it on unless the Render pre-deploy command runs the upgrade |
+| `WISHLY_SCRAPE_INLINE` | unset | `1` runs the product fetch in the request. Tests set this. Production fills the photo and price in a background thread |
 
 ```bash
 pytest
 python scripts/live_report.py
 ```
 
-Accounts, lists, and items are created by Alembic (`alembic upgrade head` runs on startup). If this database still has the old single `items` table, those rows move into **Minha lista** for the first account that signs up. A brand-new Postgres database starts empty. The free Render disk does not keep SQLite across restarts, so production must set `DATABASE_URL`.
+Accounts, lists, and items are created by Alembic. Startup runs `alembic upgrade head`, and if the database is already at head it stops after reading `alembic_version`. Set `WISHLY_MIGRATE=0` only after Render's pre-deploy command is `alembic upgrade head` (`render.yaml` sets that for a new Blueprint). If this database still has the old single `items` table, those rows move into **Minha lista** for the first account that signs up. A brand-new Postgres database starts empty. The free Render disk does not keep SQLite across restarts, so production must set `DATABASE_URL`.
+
+Postgres uses a small `psycopg_pool` (1–6 connections, TCP keepalives, a check before each checkout). Each API request holds one connection. SQLite still opens a connection per request and does not use the pool. Adding or refreshing an item saves it immediately with status `pending` and reads the store page in the background (about 10 seconds). `GET /api/health?db=1` adds `db_ms`, the time to check out a connection and run `SELECT 1`.
 
 ## API
 
@@ -53,10 +59,10 @@ Accounts, lists, and items are created by Alembic (`alembic upgrade head` runs o
 - `POST /api/lists/{id}/invites/{role}`, `POST …/regenerate`, `DELETE …/{role}` manage two invite links. `GET /c/{code}` is the preview page. `POST /api/invites/{code}/accept` joins after login.
 - `POST /api/lists/{id}/share`, `POST …/share/regenerate`, `DELETE …/share`
 - `GET /api/share/{token}` — public read-only list. `POST/DELETE …/items/{id}/reservation` marks “Já comprei”
-- `GET/POST /api/lists/{id}/items`, plus `PATCH /api/items/{id}` (`purchased` marks it bought), refresh, delete, and the image proxy. `totals` is what is still to buy. `purchased_totals` is what is already bought. Viewers and the public link can see that flag and cannot change it.
-- `GET /api/health`
+- `GET/POST /api/lists/{id}/items`, plus `PATCH /api/items/{id}` (`purchased` marks it bought), refresh, delete, and the image proxy. A new item and a refresh answer immediately with `"status": "pending"`; the photo and price arrive on a later read. `totals` is what is still to buy. `purchased_totals` is what is already bought. Viewers and the public link can see that flag and cannot change it.
+- `GET /api/health` and `GET /api/health?db=1` (`db_ms` is the checkout plus `SELECT 1`)
 
-Prices are numbers. `BRL` is formatted by the app as `R$ 1.299,90`. Other ISO currencies are left as returned by the page. The item is saved even when the store page cannot be read. A failed refresh keeps the previous photo and price.
+Prices are numbers. `BRL` is formatted by the app as `R$ 1.299,90`. Other ISO currencies are left as returned by the page. The item is saved even when the store page cannot be read. A failed refresh keeps the previous photo and price. Changing the product link does not: the store name is taken from the new domain and the old photo and price are replaced by a new read. A store that answers with a block page is saved with no price and the message “Essa loja bloqueia a busca automática; edite o preço manualmente”.
 
 ## How image and price are read
 
@@ -108,7 +114,20 @@ docker build -t quero-api .
 docker run --rm -p 47231:10000 -e PORT=10000 quero-api
 ```
 
-`GET /api/health` returns `"database": "postgres"` or `"sqlite"`.
+`GET /api/health` returns `"database": "postgres"` or `"sqlite"`. `GET /api/health?db=1` also returns `db_ms`.
+
+### Render and Neon
+
+You do not have to change anything for this deploy to keep working. Startup still migrates, and it returns immediately when the database is already at head.
+
+Optional, on the existing Render service `lista-desejos-backend` (Oregon):
+
+1. Set **Pre-Deploy Command** to `alembic upgrade head`.
+2. After a deploy shows that command succeeded, you may set `WISHLY_MIGRATE=0`. If you set that variable without the pre-deploy command, later schema changes will not run.
+
+Do not change the region. Neon can stay in `sa-east-1`. If `DATABASE_URL` already uses the `-pooler` host, it is used as-is. A direct host works too. The app opens at most 6 connections (`WISHLY_DB_POOL_MAX`).
+
+`.github/workflows/keepalive.yml` pings `https://lista-desejos-backend.onrender.com/api/health` every 10 minutes. GitHub schedules are best-effort and often start late. It runs only from the backend repository's default branch.
 
 ## Limitations
 

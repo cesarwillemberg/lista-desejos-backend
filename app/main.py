@@ -6,16 +6,19 @@ import hashlib
 import hmac
 import html
 import json
+import logging
 import os
 import re
 import secrets
+import threading
+import time
 from collections import OrderedDict
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from threading import Lock
 
-from fastapi import Depends, FastAPI, Header, HTTPException
+from fastapi import Depends, FastAPI, Header, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
@@ -23,15 +26,21 @@ from pydantic import BaseModel, ConfigDict
 from starlette.requests import Request
 
 from app import db
-from app.auth import current_user, hash_password, issue_token, jwt_secret, verify_password
+from app.auth import current_user, hash_password, issue_token, jwt_secret, password_needs_rehash, verify_password
 from app.extractor import Extracted, extract_product, store_name
 from app.fetch import ensure_public_url, fetch_image
 from app.limit import limit_auth, limit_scrape
 from app.share_codes import new_short_code
 
+logger = logging.getLogger("wishly.api")
+
 _image_cache: OrderedDict[tuple[str, str], tuple[bytes, str]] = OrderedDict()
 _image_lock = Lock()
 _IMAGE_CACHE_MAX = 24
+_scrape_cache: OrderedDict[str, tuple[float, Extracted]] = OrderedDict()
+_scrape_lock = Lock()
+_SCRAPE_TTL = 600.0
+_SCRAPE_MAX = 64
 
 
 class AuthBody(BaseModel):
@@ -70,6 +79,7 @@ class ItemCreate(BaseModel):
 class ItemUpdate(BaseModel):
     model_config = ConfigDict(extra="ignore")
     name: str | None = None
+    url: str | None = None
     image_url: str | None = None
     price: float | None = None
     currency: str | None = None
@@ -332,14 +342,128 @@ def _fields_from_extraction(extracted: Extracted, url: str) -> dict:
     }
 
 
+def _cached_extract(url: str) -> Extracted:
+    now = time.monotonic()
+    with _scrape_lock:
+        hit = _scrape_cache.get(url)
+        if hit is not None and now - hit[0] < _SCRAPE_TTL:
+            _scrape_cache.move_to_end(url)
+            return hit[1]
+    extracted = extract_product(url)
+    with _scrape_lock:
+        _scrape_cache[url] = (time.monotonic(), extracted)
+        _scrape_cache.move_to_end(url)
+        while len(_scrape_cache) > _SCRAPE_MAX:
+            _scrape_cache.popitem(last=False)
+    return extracted
+
+
+def _replace_changes(extracted: Extracted, url: str, *, update_name: bool) -> dict:
+    """New link: store, photo and price come only from this page."""
+    changes = {
+        "store": store_name(url),
+        "image_url": extracted.image_url,
+        "price": extracted.price,
+        "currency": extracted.currency,
+        "status": extracted.status,
+        "message": extracted.message,
+        "image_source": extracted.image_source,
+        "price_source": extracted.price_source,
+    }
+    if update_name and extracted.title:
+        changes["name"] = extracted.title[:160]
+    return changes
+
+
+def _refresh_changes(extracted: Extracted, url: str, previous: dict) -> dict:
+    changes: dict = {"store": store_name(url)}
+    if extracted.image_url:
+        changes["image_url"] = extracted.image_url
+        changes["image_source"] = extracted.image_source
+    if extracted.price is not None:
+        changes["price"] = extracted.price
+        changes["currency"] = extracted.currency
+        changes["price_source"] = extracted.price_source
+    image = changes.get("image_url", previous.get("image_url"))
+    price = changes.get("price", previous.get("price"))
+    if extracted.image_url is None and extracted.price is None:
+        kept = "Mantivemos a foto e o preço que já estavam salvos."
+        detail = extracted.message or "Não foi possível ler a página agora."
+        changes["message"] = f"{detail} {kept}"
+        changes["status"] = previous.get("status") if previous.get("status") not in {None, "pending"} else "failed"
+    elif image and price is not None:
+        changes["status"] = "ok"
+        changes["message"] = None
+    elif image:
+        changes["status"] = "partial"
+        changes["message"] = "Atualizamos a foto, mas o preço continua indisponível."
+    else:
+        changes["status"] = "partial"
+        changes["message"] = "Atualizamos o preço, mas a foto continua indisponível."
+    return changes
+
+
+def _apply_scrape(item_id: str, url: str, previous: dict | None, *, use_cache: bool, replace: bool = False, update_name: bool = False) -> None:
+    token = db.detach_request()
+    try:
+        extracted = _cached_extract(url) if use_cache else extract_product(url)
+        if replace or previous is None:
+            changes = _replace_changes(extracted, url, update_name=update_name) if replace else _fields_from_extraction(extracted, url)
+        else:
+            changes = _refresh_changes(extracted, url, previous)
+        db.update_item(item_id, changes)
+    except Exception:
+        logger.exception("scrape failed for item %s", item_id)
+        failed = {"status": "failed", "message": "Não foi possível ler a página da loja.", "store": store_name(url)}
+        if replace:
+            failed["image_url"] = None
+            failed["price"] = None
+            failed["currency"] = None
+        db.update_item(item_id, failed)
+    finally:
+        db.restore_request(token)
+
+
+def schedule_scrape(
+    item_id: str,
+    url: str,
+    previous: dict | None = None,
+    *,
+    use_cache: bool = True,
+    replace: bool = False,
+    update_name: bool = False,
+) -> None:
+    db.commit_request()
+    inline = (os.environ.get("WISHLY_SCRAPE_INLINE") or "").strip().lower() in {"1", "true", "yes"}
+    if inline:
+        _apply_scrape(item_id, url, previous, use_cache=use_cache, replace=replace, update_name=update_name)
+        return
+    threading.Thread(
+        target=_apply_scrape,
+        args=(item_id, url, previous),
+        kwargs={"use_cache": use_cache, "replace": replace, "update_name": update_name},
+        daemon=True,
+        name="wishly-scrape",
+    ).start()
+
+
+def _needs_db(request: Request) -> bool:
+    path = request.url.path
+    if path == "/api/health":
+        return False
+    return path.startswith("/api") or path.startswith("/s/") or path.startswith("/c/")
+
+
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     jwt_secret()
     db.migrate()
+    db.open_pool()
     web = _web_dir()
     if os.environ.get("QUERO_DISABLE_WEB") != "1" and (web / "index.html").is_file():
         _app.mount("/", StaticFiles(directory=str(web), html=True), name="web")
     yield
+    db.close_pool()
 
 
 _PAGES_ORIGIN = "https://cesarwillemberg.github.io"
@@ -358,6 +482,22 @@ def _cors_origins() -> list[str]:
 
 
 app = FastAPI(title="Wishly", lifespan=lifespan)
+
+
+@app.middleware("http")
+async def one_db_connection(request: Request, call_next):
+    if not _needs_db(request):
+        return await call_next(request)
+    conn, token = db.begin_request()
+    try:
+        response = await call_next(request)
+    except Exception:
+        db.end_request(conn, token, commit=False)
+        raise
+    db.end_request(conn, token, commit=response.status_code < 400)
+    return response
+
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=_cors_origins(),
@@ -373,8 +513,18 @@ async def value_error_handler(_request: Request, exc: ValueError):
 
 
 @app.get("/api/health")
-def health():
-    return {"ok": True, "database": db.engine_name()}
+def health(db_check: str | None = Query(default=None, alias="db")):
+    payload = {"ok": True, "database": db.engine_name()}
+    if db_check == "1":
+        started = time.perf_counter()
+        conn = db.checkout()
+        try:
+            conn.execute("SELECT 1")
+            conn.commit()
+        finally:
+            conn.release()
+        payload["db_ms"] = round((time.perf_counter() - started) * 1000, 1)
+    return payload
 
 
 @app.get("/.well-known/assetlinks.json")
@@ -503,8 +653,11 @@ def login(body: AuthBody, _: None = Depends(limit_auth)):
     email = _clean_email(body.email)
     password = _clean_password(body.password)
     found = db.get_user_by_email(email)
-    if found is None or not verify_password(password, found.pop("password_hash")):
+    password_hash = None if found is None else found.pop("password_hash")
+    if found is None or password_hash is None or not verify_password(password, password_hash):
         raise HTTPException(401, "E-mail ou senha incorretos.")
+    if password_needs_rehash(password_hash):
+        db.set_password_hash(found["id"], hash_password(password))
     return _auth_payload(found)
 
 
@@ -741,7 +894,6 @@ def create_item(list_id: str, body: ItemCreate, user: dict = Depends(current_use
     if len(url) > 2000:
         raise HTTPException(400, "Esse link é longo demais.")
     ensure_public_url(url)
-    extracted = extract_product(url)
     item = db.insert_item(
         list_id,
         {
@@ -749,9 +901,12 @@ def create_item(list_id: str, body: ItemCreate, user: dict = Depends(current_use
             "url": url,
             "category_id": _category_on_list(list_id, body.category_id),
             "added_by": user["id"],
-            **_fields_from_extraction(extracted, url),
+            "store": store_name(url),
+            "status": "pending",
+            "message": "Lendo a página da loja…",
         },
     )
+    schedule_scrape(item["id"], url)
     return _present_items([item], member=True, user_id=user["id"])[0]
 
 
@@ -760,9 +915,17 @@ def patch_item(item_id: str, body: ItemUpdate, user: dict = Depends(current_user
     current = _require_item(item_id, user)
     sent = body.model_fields_set
     changes: dict = {}
+    new_url = None
+    if "url" in sent:
+        new_url = (body.url or "").strip()
+        if len(new_url) > 2000:
+            raise HTTPException(400, "Esse link é longo demais.")
+        ensure_public_url(new_url)
+        if new_url == current["url"]:
+            new_url = None
     if "name" in sent:
         changes["name"] = _clean_name(body.name or "")
-    if "image_url" in sent:
+    if new_url is None and "image_url" in sent:
         raw = (body.image_url or "").strip()
         if not raw:
             changes["image_url"] = None
@@ -773,7 +936,7 @@ def patch_item(item_id: str, body: ItemUpdate, user: dict = Depends(current_user
             ensure_public_url(raw)
             changes["image_url"] = raw
             changes["image_source"] = "manual"
-    if "price" in sent:
+    if new_url is None and "price" in sent:
         if body.price is None:
             changes["price"] = None
             changes["price_source"] = "manual"
@@ -782,7 +945,7 @@ def patch_item(item_id: str, body: ItemUpdate, user: dict = Depends(current_user
                 raise HTTPException(400, "Informe um preço válido.")
             changes["price"] = round(float(body.price), 2)
             changes["price_source"] = "manual"
-    if "currency" in sent:
+    if new_url is None and "currency" in sent:
         changes["currency"] = _clean_currency(body.currency)
     if "category_id" in sent:
         changes["category_id"] = _category_on_list(current["list_id"], body.category_id)
@@ -795,7 +958,7 @@ def patch_item(item_id: str, body: ItemUpdate, user: dict = Depends(current_user
             changes["purchased"] = 0
             changes["purchased_at"] = None
             changes["purchased_by"] = None
-    if not changes:
+    if not changes and new_url is None:
         return _present_items([current], member=True, user_id=user["id"])[0]
     content_changed = any(key in changes for key in ("image_url", "price", "currency"))
     image = changes["image_url"] if "image_url" in changes else current["image_url"]
@@ -812,44 +975,33 @@ def patch_item(item_id: str, body: ItemUpdate, user: dict = Depends(current_user
     elif content_changed:
         changes["status"] = "failed"
         changes["message"] = "Foto e preço não informados."
+    if new_url is not None:
+        changes["url"] = new_url
+        changes["store"] = store_name(new_url)
+        changes["price"] = None
+        changes["currency"] = None
+        changes["image_url"] = None
+        changes["image_source"] = None
+        changes["price_source"] = None
+        changes["status"] = "pending"
+        changes["message"] = "Lendo a página da loja…"
     updated = db.update_item(item_id, changes)
     if updated is None:
         raise HTTPException(404, "Item não encontrado.")
+    if new_url is not None:
+        name_edited = "name" in sent and changes.get("name") != current["name"]
+        schedule_scrape(item_id, new_url, previous=current, use_cache=False, replace=True, update_name=not name_edited)
     return _present_items([updated], member=True, user_id=user["id"])[0]
 
 
 @app.post("/api/items/{item_id}/refresh")
 def refresh_item(item_id: str, user: dict = Depends(current_user), _: None = Depends(limit_scrape)):
     current = _require_item(item_id, user)
-    extracted = extract_product(current["url"])
-    changes: dict = {"store": store_name(current["url"])}
-    if extracted.image_url:
-        changes["image_url"] = extracted.image_url
-        changes["image_source"] = extracted.image_source
-    if extracted.price is not None:
-        changes["price"] = extracted.price
-        changes["currency"] = extracted.currency
-        changes["price_source"] = extracted.price_source
-    image = changes.get("image_url", current["image_url"])
-    price = changes.get("price", current["price"])
-    if extracted.image_url is None and extracted.price is None:
-        kept = "Mantivemos a foto e o preço que já estavam salvos."
-        detail = extracted.message or "Não foi possível ler a página agora."
-        changes["message"] = f"{detail} {kept}"
-        changes["status"] = current["status"]
-    elif image and price is not None:
-        changes["status"] = "ok"
-        changes["message"] = None
-    elif image:
-        changes["status"] = "partial"
-        changes["message"] = "Atualizamos a foto, mas o preço continua indisponível."
-    else:
-        changes["status"] = "partial"
-        changes["message"] = "Atualizamos o preço, mas a foto continua indisponível."
-    updated = db.update_item(item_id, changes)
-    if updated is None:
+    pending = db.update_item(item_id, {"status": "pending", "message": "Atualizando a página da loja…"})
+    if pending is None:
         raise HTTPException(404, "Item não encontrado.")
-    return _present_items([updated], member=True, user_id=user["id"])[0]
+    schedule_scrape(item_id, current["url"], previous=current, use_cache=False)
+    return _present_items([pending], member=True, user_id=user["id"])[0]
 
 
 @app.post("/api/items/{item_id}/reservation")

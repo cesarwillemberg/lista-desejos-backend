@@ -33,6 +33,18 @@ def test_parse_price(raw, br_text, expected):
     assert parse_price(raw, br_text=br_text) == expected
 
 
+def test_gzip_body_is_decompressed_before_parsing():
+    import gzip
+
+    from app.fetch import decode_body
+
+    page = _html("kabum.html").encode()
+    html = decode_body(gzip.compress(page), "gzip")
+    result = extract_html(html, "https://www.kabum.com.br/produto/953110")
+    assert result.price == 6196.39
+    assert "__NEXT" not in html[:2]
+
+
 def test_kabum_jsonld_price_and_image():
     result = extract_html(_html("kabum.html"), "https://www.kabum.com.br/produto/953110")
     assert result.status == "ok"
@@ -41,6 +53,32 @@ def test_kabum_jsonld_price_and_image():
     assert result.price_source == "json-ld"
     assert result.image_url and "images.kabum.com.br" in result.image_url
     assert "large" in result.image_url
+
+
+def test_kabum_next_data_prefers_discount_over_list_price():
+    result = extract_html(_html("kabum_next.html"), "https://www.kabum.com.br/produto/520369")
+    assert result.status == "ok"
+    assert result.price == 2499.99
+    assert result.currency == "BRL"
+    assert result.price_source == "json:next-data"
+    assert result.title and "5700X3D" in result.title
+    assert result.image_url and "large.jpg" in result.image_url
+
+
+def test_kabum_offer_list_and_product_meta():
+    result = extract_html(_html("kabum_offers.html"), "https://www.kabum.com.br/produto/1")
+    assert result.status == "ok"
+    assert result.price == 189.90
+    assert result.currency == "BRL"
+    assert result.price_source == "json-ld"
+    assert result.image_url and result.image_url.endswith("teclado-large.jpg")
+
+
+def test_aggregate_offer_low_price():
+    result = extract_html(_html("aggregate_offer.html"), "https://loja.example.com/mouse")
+    assert result.price == 89.90
+    assert result.currency == "BRL"
+    assert result.image_url == "https://cdn.example.com/mouse-large.jpg"
 
 
 def test_americanas_jsonld_and_meta():
@@ -98,6 +136,15 @@ def test_microdata():
     assert result.image_url == "https://cdn.example.com/fone.jpg"
 
 
+def test_mercadolivre_saved_page():
+    result = extract_html(_html("mercadolivre.html"), "https://www.mercadolivre.com.br/p/MLB25909879")
+    assert result.status == "ok"
+    assert result.price == 1299.90
+    assert result.currency == "BRL"
+    assert result.price_source == "html:mercadolivre"
+    assert result.image_url and result.image_url.endswith("123-F.jpg")
+
+
 def test_mercadolivre_andes_markup():
     html = """
     <html><head>
@@ -153,7 +200,7 @@ def test_magalu_block_page_has_no_price():
     assert result.status == "failed"
     assert result.price is None
     assert result.image_url is None
-    assert "Magazine Luiza" in (result.message or "")
+    assert result.message == "Essa loja bloqueia a busca automática; edite o preço manualmente"
 
 
 def test_mercadolivre_verification_page():

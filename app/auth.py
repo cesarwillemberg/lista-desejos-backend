@@ -12,7 +12,9 @@ from fastapi import Header, HTTPException
 
 from app import db
 
-_hasher = PasswordHasher()
+# OWASP minimum. The library default (64 MiB, parallelism 4) takes about a
+# second and a half on Render's small instance.
+_hasher = PasswordHasher(time_cost=2, memory_cost=19456, parallelism=1)
 _ALGORITHM = "HS256"
 _TOKEN_DAYS = 30
 
@@ -35,6 +37,10 @@ def verify_password(password: str, password_hash: str) -> bool:
         return False
 
 
+def password_needs_rehash(password_hash: str) -> bool:
+    return _hasher.check_needs_rehash(password_hash)
+
+
 def issue_token(user_id: str, email: str) -> str:
     now = datetime.now(timezone.utc)
     payload = {
@@ -55,8 +61,11 @@ def current_user(authorization: str | None = Header(default=None)) -> dict:
     except jwt.PyJWTError as exc:
         raise HTTPException(401, "Sessão inválida. Entre de novo.") from exc
     user_id = payload.get("sub")
+    email = payload.get("email")
     if not isinstance(user_id, str):
         raise HTTPException(401, "Sessão inválida. Entre de novo.")
+    if isinstance(email, str) and email:
+        return {"id": user_id, "email": email}
     user = db.get_user(user_id)
     if user is None:
         raise HTTPException(401, "Sessão inválida. Entre de novo.")

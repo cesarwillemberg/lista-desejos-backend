@@ -8,14 +8,24 @@ the list after a restart.
 
 from __future__ import annotations
 
+import logging
 import os
 import sqlite3
 import threading
+from contextvars import ContextVar, Token
 from datetime import datetime, timezone
 from pathlib import Path
 from uuid import uuid4
 
-_lock = threading.Lock()
+logger = logging.getLogger("wishly.db")
+
+# One borrowed connection per request. Helpers call connect() and reuse it
+# instead of opening another. Background work clears the context and checks
+# out its own connection so a scrape does not hold a pool slot.
+_request_conn: ContextVar["_Conn | None"] = ContextVar("wishly_request_conn", default=None)
+_pool = None
+_pool_guard = threading.Lock()
+checkouts = 0
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS items (
@@ -58,15 +68,58 @@ def sqlalchemy_url() -> str:
     return "sqlite:///" + path.as_posix()
 
 
+def _migrate_enabled() -> bool:
+    flag = (os.environ.get("WISHLY_MIGRATE") or "1").strip().lower()
+    return flag not in {"0", "false", "no", "off"}
+
+
 def migrate() -> None:
+    """Upgrade to head, or return after one version read when already there.
+
+    `WISHLY_MIGRATE=0` skips this entirely. Leave it on unless Render's
+    pre-deploy command runs `alembic upgrade head`.
+    """
+    if not _migrate_enabled():
+        logger.info("skipping startup migrations because WISHLY_MIGRATE is off")
+        return
     from alembic import command
     from alembic.config import Config
+    from alembic.script import ScriptDirectory
 
     root = Path(__file__).resolve().parents[1]
     cfg = Config(str(root / "alembic.ini"))
     cfg.set_main_option("script_location", str(root / "alembic"))
     cfg.set_main_option("sqlalchemy.url", sqlalchemy_url())
+    head = ScriptDirectory.from_config(cfg).get_current_head()
+    current = _alembic_version()
+    if current == head:
+        logger.info("database already at alembic head %s", head)
+        return
+    logger.info("upgrading database from %s to %s", current, head)
     command.upgrade(cfg, "head")
+
+
+def _alembic_version() -> str | None:
+    try:
+        with connect() as conn:
+            row = conn.execute("SELECT version_num FROM alembic_version").fetchone()
+    except Exception:
+        logger.info("alembic version is not readable yet")
+        return None
+    if row is None:
+        return None
+    if isinstance(row, dict) or hasattr(row, "keys"):
+        try:
+            value = row["version_num"]
+        except (KeyError, IndexError, TypeError):
+            value = None
+        if isinstance(value, str):
+            return value
+    try:
+        value = row[0]
+    except (KeyError, IndexError, TypeError):
+        return None
+    return value if isinstance(value, str) else None
 
 
 def db_path() -> Path:
@@ -77,13 +130,26 @@ def db_path() -> Path:
 
 
 class _Conn:
-    def __init__(self, raw, postgres: bool):
+    def __init__(self, raw, postgres: bool, release):
         self._raw = raw
         self._postgres = postgres
+        self._release = release
 
     def execute(self, sql: str, params: tuple = ()):
         statement = sql.replace("?", "%s") if self._postgres else sql
         return self._raw.execute(statement, params)
+
+    def commit(self) -> None:
+        self._raw.commit()
+
+    def rollback(self) -> None:
+        self._raw.rollback()
+
+    def release(self) -> None:
+        release = self._release
+        self._release = None
+        if release is not None:
+            release()
 
     def __enter__(self):
         return self
@@ -91,35 +157,156 @@ class _Conn:
     def __exit__(self, exc_type, exc, tb):
         try:
             if exc_type:
-                self._raw.rollback()
+                self.rollback()
             else:
-                self._raw.commit()
+                self.commit()
         finally:
-            self._raw.close()
+            self.release()
         return False
 
 
-def connect() -> _Conn:
-    url = database_url()
-    if url:
-        import psycopg
-        from psycopg.rows import dict_row
+class _Borrow:
+    """Uses the request connection and lets the request commit or roll back."""
 
-        if url.startswith("postgres://"):
-            url = "postgresql://" + url[len("postgres://") :]
-        raw = psycopg.connect(url, row_factory=dict_row, connect_timeout=15)
-        return _Conn(raw, postgres=True)
+    def __init__(self, conn: _Conn):
+        self._conn = conn
+        self._postgres = conn._postgres
+
+    def execute(self, sql: str, params: tuple = ()):
+        return self._conn.execute(sql, params)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        return False
+
+
+def _postgres_dsn() -> str:
+    url = database_url() or ""
+    if url.startswith("postgres://"):
+        return "postgresql://" + url[len("postgres://") :]
+    return url
+
+
+def pool():
+    """Lazy psycopg pool. A `-pooler` host in DATABASE_URL is used as-is."""
+    global _pool
+    if _pool is not None:
+        return _pool
+    with _pool_guard:
+        if _pool is None:
+            from psycopg.rows import dict_row
+            from psycopg_pool import ConnectionPool
+
+            min_size = _pool_size("WISHLY_DB_POOL_MIN", 1)
+            max_size = max(_pool_size("WISHLY_DB_POOL_MAX", 6), min_size)
+            _pool = ConnectionPool(
+                conninfo=_postgres_dsn(),
+                min_size=min_size,
+                max_size=max_size,
+                timeout=15,
+                max_idle=300,
+                max_lifetime=1800,
+                check=ConnectionPool.check_connection,
+                kwargs={
+                    "row_factory": dict_row,
+                    "autocommit": False,
+                    "prepare_threshold": None,
+                    "connect_timeout": 15,
+                    "keepalives": 1,
+                    "keepalives_idle": 30,
+                    "keepalives_interval": 10,
+                    "keepalives_count": 5,
+                },
+                open=True,
+            )
+            logger.info("postgres pool min=%s max=%s", min_size, max_size)
+    return _pool
+
+
+def _pool_size(name: str, default: int) -> int:
+    raw = (os.environ.get(name) or "").strip()
+    if not raw:
+        return default
+    try:
+        return max(1, int(raw))
+    except ValueError:
+        return default
+
+
+def open_pool() -> None:
+    if database_url():
+        pool().open()
+
+
+def close_pool() -> None:
+    global _pool
+    if _pool is not None:
+        _pool.close()
+        _pool = None
+
+
+def checkout() -> _Conn:
+    global checkouts
+    checkouts += 1
+    if database_url():
+        raw = pool().getconn()
+
+        def _put(connection=raw) -> None:
+            pool().putconn(connection)
+
+        return _Conn(raw, True, _put)
     path = db_path()
     path.parent.mkdir(parents=True, exist_ok=True)
-    raw = sqlite3.connect(path, timeout=15)
+    raw = sqlite3.connect(path, timeout=15, check_same_thread=False)
     raw.row_factory = sqlite3.Row
     raw.execute("PRAGMA journal_mode=WAL")
     raw.execute("PRAGMA foreign_keys=ON")
-    return _Conn(raw, postgres=False)
+    return _Conn(raw, False, raw.close)
+
+
+def connect():
+    current = _request_conn.get()
+    if current is not None:
+        return _Borrow(current)
+    return checkout()
+
+
+def begin_request() -> tuple[_Conn, Token]:
+    conn = checkout()
+    token = _request_conn.set(conn)
+    return conn, token
+
+
+def end_request(conn: _Conn, token: Token, *, commit: bool) -> None:
+    try:
+        if commit:
+            conn.commit()
+        else:
+            conn.rollback()
+    finally:
+        _request_conn.reset(token)
+        conn.release()
+
+
+def commit_request() -> None:
+    """Make a pending insert visible to a background scrape."""
+    current = _request_conn.get()
+    if current is not None:
+        current.commit()
+
+
+def detach_request() -> Token:
+    return _request_conn.set(None)
+
+
+def restore_request(token: Token) -> None:
+    _request_conn.reset(token)
 
 
 def init_db() -> None:
-    with _lock, connect() as conn:
+    with connect() as conn:
         conn.execute(SCHEMA)
 
 
@@ -252,16 +439,6 @@ def _member_rows(conn: _Conn, list_id: str) -> list[dict]:
     return [_member_from_row(row) for row in rows]
 
 
-def _decorate_list(conn: _Conn, row, items: list[dict], role: str) -> dict:
-    payload = row_to_list(row, items)
-    payload["role"] = role
-    payload["members"] = _member_rows(conn, row["id"])
-    keys = row.keys()
-    payload["invite_editor_code"] = row["invite_editor_code"] if "invite_editor_code" in keys else None
-    payload["invite_viewer_code"] = row["invite_viewer_code"] if "invite_viewer_code" in keys else None
-    return payload
-
-
 def _insert_owner(conn: _Conn, list_id: str, user_id: str, now: str) -> None:
     conn.execute(
         "INSERT INTO list_members (id, list_id, user_id, role, created_at) VALUES (?, ?, ?, 'owner', ?)",
@@ -276,13 +453,18 @@ def public_item(item: dict, *, mine: bool) -> dict:
 
 
 def get_user(user_id: str) -> dict | None:
-    with _lock, connect() as conn:
+    with connect() as conn:
         row = conn.execute("SELECT id, email, created_at FROM users WHERE id = ?", (user_id,)).fetchone()
     return row_to_user(row) if row else None
 
 
+def set_password_hash(user_id: str, password_hash: str) -> None:
+    with connect() as conn:
+        conn.execute("UPDATE users SET password_hash = ? WHERE id = ?", (password_hash, user_id))
+
+
 def get_user_by_email(email: str) -> dict | None:
-    with _lock, connect() as conn:
+    with connect() as conn:
         row = conn.execute("SELECT id, email, password_hash, created_at FROM users WHERE email = ?", (email,)).fetchone()
     if row is None:
         return None
@@ -295,7 +477,7 @@ def register_user(email: str, password_hash: str) -> dict:
     now = utc_now()
     user_id = str(uuid4())
     list_id = str(uuid4())
-    with _lock, connect() as conn:
+    with connect() as conn:
         exists = conn.execute("SELECT id FROM users WHERE email = ?", (email,)).fetchone()
         if exists:
             raise ValueError("Este e-mail já tem uma conta.")
@@ -367,8 +549,115 @@ def _adopt_legacy(conn: _Conn, list_id: str, now: str) -> None:
         conn.execute("DROP TABLE legacy_items")
 
 
+def _marks(ids: list[str]) -> tuple[str, tuple]:
+    return ", ".join("?" for _ in ids), tuple(ids)
+
+
+def _money_rows(rows, amount_key: str) -> list[dict]:
+    pairs = []
+    for row in rows:
+        amount = row[amount_key]
+        if amount is None:
+            continue
+        value = round(float(amount), 2)
+        if value == 0:
+            continue
+        pairs.append((row["currency"] or "", value))
+    return [
+        {"currency": key or None, "amount": value}
+        for key, value in sorted(pairs, key=lambda pair: (pair[0] != "BRL", pair[0] == "", pair[0]))
+    ]
+
+
+def _counts_for(conn, list_ids: list[str]) -> dict[str, tuple[int, int]]:
+    if not list_ids:
+        return {}
+    marks, params = _marks(list_ids)
+    rows = conn.execute(
+        f"""
+        SELECT list_id,
+               COUNT(*) AS item_count,
+               SUM(CASE WHEN price IS NULL AND COALESCE(purchased, 0) = 0 THEN 1 ELSE 0 END) AS unpriced_count
+        FROM items
+        WHERE list_id IN ({marks})
+        GROUP BY list_id
+        """,
+        params,
+    ).fetchall()
+    return {row["list_id"]: (int(row["item_count"]), int(row["unpriced_count"] or 0)) for row in rows}
+
+
+def _totals_for(conn, list_ids: list[str]) -> dict[str, tuple[list[dict], list[dict]]]:
+    if not list_ids:
+        return {}
+    marks, params = _marks(list_ids)
+    rows = conn.execute(
+        f"""
+        SELECT list_id,
+               COALESCE(currency, '') AS currency,
+               SUM(CASE WHEN COALESCE(purchased, 0) = 0 THEN price ELSE 0 END) AS remaining,
+               SUM(CASE WHEN COALESCE(purchased, 0) != 0 THEN price ELSE 0 END) AS bought
+        FROM items
+        WHERE list_id IN ({marks}) AND price IS NOT NULL
+        GROUP BY list_id, COALESCE(currency, '')
+        """,
+        params,
+    ).fetchall()
+    grouped: dict[str, list] = {}
+    for row in rows:
+        grouped.setdefault(row["list_id"], []).append(row)
+    return {
+        list_id: (_money_rows(bucket, "remaining"), _money_rows(bucket, "bought"))
+        for list_id, bucket in grouped.items()
+    }
+
+
+def _members_for(conn, list_ids: list[str]) -> dict[str, list[dict]]:
+    if not list_ids:
+        return {}
+    marks, params = _marks(list_ids)
+    rows = conn.execute(
+        f"""
+        SELECT list_members.list_id, list_members.user_id, list_members.role, users.email
+        FROM list_members
+        JOIN users ON users.id = list_members.user_id
+        WHERE list_members.list_id IN ({marks})
+        ORDER BY CASE list_members.role WHEN 'owner' THEN 0 WHEN 'editor' THEN 1 ELSE 2 END, users.email
+        """,
+        params,
+    ).fetchall()
+    grouped: dict[str, list[dict]] = {}
+    for row in rows:
+        grouped.setdefault(row["list_id"], []).append(_member_from_row(row))
+    return grouped
+
+
+def _summary(row, role: str, counts: dict, totals: dict, members: dict) -> dict:
+    list_id = row["id"]
+    item_count, unpriced = counts.get(list_id, (0, 0))
+    remaining, bought = totals.get(list_id, ([], []))
+    keys = row.keys()
+    return {
+        "id": list_id,
+        "name": row["name"],
+        "user_id": row["user_id"],
+        "share_token": row["share_token"],
+        "short_code": row["short_code"] if "short_code" in keys else None,
+        "item_count": item_count,
+        "unpriced_count": unpriced,
+        "totals": remaining,
+        "purchased_totals": bought,
+        "created_at": row["created_at"],
+        "updated_at": row["updated_at"],
+        "role": role,
+        "members": members.get(list_id, []),
+        "invite_editor_code": row["invite_editor_code"] if "invite_editor_code" in keys else None,
+        "invite_viewer_code": row["invite_viewer_code"] if "invite_viewer_code" in keys else None,
+    }
+
+
 def lists_for_user(user_id: str) -> list[dict]:
-    with _lock, connect() as conn:
+    with connect() as conn:
         rows = conn.execute(
             """
             SELECT lists.*, list_members.role AS member_role
@@ -379,21 +668,15 @@ def lists_for_user(user_id: str) -> list[dict]:
             """,
             (user_id,),
         ).fetchall()
-        result = []
-        for row in rows:
-            items = [
-                row_to_item(item)
-                for item in conn.execute(
-                    "SELECT * FROM items WHERE list_id = ? ORDER BY created_at DESC",
-                    (row["id"],),
-                ).fetchall()
-            ]
-            result.append(_decorate_list(conn, row, items, row["member_role"]))
-    return result
+        ids = [row["id"] for row in rows]
+        counts = _counts_for(conn, ids)
+        totals = _totals_for(conn, ids)
+        members = _members_for(conn, ids)
+        return [_summary(row, row["member_role"], counts, totals, members) for row in rows]
 
 
 def get_list_for_member(list_id: str, user_id: str) -> dict | None:
-    with _lock, connect() as conn:
+    with connect() as conn:
         row = conn.execute(
             """
             SELECT lists.*, list_members.role AS member_role
@@ -405,11 +688,8 @@ def get_list_for_member(list_id: str, user_id: str) -> dict | None:
         ).fetchone()
         if row is None:
             return None
-        items = [
-            row_to_item(item)
-            for item in conn.execute("SELECT * FROM items WHERE list_id = ?", (list_id,)).fetchall()
-        ]
-        return _decorate_list(conn, row, items, row["member_role"])
+        ids = [list_id]
+        return _summary(row, row["member_role"], _counts_for(conn, ids), _totals_for(conn, ids), _members_for(conn, ids))
 
 
 def get_owned_list(list_id: str, user_id: str) -> dict | None:
@@ -422,7 +702,7 @@ def get_owned_list(list_id: str, user_id: str) -> dict | None:
 def create_list(user_id: str, name: str) -> dict:
     now = utc_now()
     list_id = str(uuid4())
-    with _lock, connect() as conn:
+    with connect() as conn:
         conn.execute(
             "INSERT INTO lists (id, user_id, name, share_token, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
             (list_id, user_id, name, None, now, now),
@@ -435,7 +715,7 @@ def create_list(user_id: str, name: str) -> dict:
 
 def rename_list(list_id: str, user_id: str, name: str) -> dict | None:
     now = utc_now()
-    with _lock, connect() as conn:
+    with connect() as conn:
         cursor = conn.execute(
             "UPDATE lists SET name = ?, updated_at = ? WHERE id = ? AND user_id = ?",
             (name, now, list_id, user_id),
@@ -446,13 +726,13 @@ def rename_list(list_id: str, user_id: str, name: str) -> dict | None:
 
 
 def delete_list(list_id: str, user_id: str) -> bool:
-    with _lock, connect() as conn:
+    with connect() as conn:
         cursor = conn.execute("DELETE FROM lists WHERE id = ? AND user_id = ?", (list_id, user_id))
         return cursor.rowcount > 0
 
 
 def short_code_taken(code: str, *, except_list_id: str | None = None) -> bool:
-    with _lock, connect() as conn:
+    with connect() as conn:
         if except_list_id:
             row = conn.execute(
                 "SELECT 1 FROM lists WHERE short_code = ? AND id != ?",
@@ -465,7 +745,7 @@ def short_code_taken(code: str, *, except_list_id: str | None = None) -> bool:
 
 def set_share(list_id: str, user_id: str, token: str | None, code: str | None) -> dict | None:
     now = utc_now()
-    with _lock, connect() as conn:
+    with connect() as conn:
         if code:
             clash = conn.execute(
                 "SELECT id FROM lists WHERE short_code = ? AND id != ?",
@@ -483,7 +763,7 @@ def set_share(list_id: str, user_id: str, token: str | None, code: str | None) -
 
 
 def get_list_by_share_token(token: str) -> dict | None:
-    with _lock, connect() as conn:
+    with connect() as conn:
         row = conn.execute(
             "SELECT * FROM lists WHERE short_code = ? OR share_token = ?",
             (token, token),
@@ -503,7 +783,7 @@ def get_list_by_share_token(token: str) -> dict | None:
 
 
 def list_items(list_id: str) -> list[dict]:
-    with _lock, connect() as conn:
+    with connect() as conn:
         rows = conn.execute(
             "SELECT * FROM items WHERE list_id = ? ORDER BY created_at DESC",
             (list_id,),
@@ -512,13 +792,13 @@ def list_items(list_id: str) -> list[dict]:
 
 
 def get_item(item_id: str) -> dict | None:
-    with _lock, connect() as conn:
+    with connect() as conn:
         row = conn.execute("SELECT * FROM items WHERE id = ?", (item_id,)).fetchone()
     return row_to_item(row) if row else None
 
 
 def user_owns_item(user_id: str, item_id: str) -> dict | None:
-    with _lock, connect() as conn:
+    with connect() as conn:
         row = conn.execute(
             """
             SELECT items.* FROM items
@@ -533,7 +813,7 @@ def user_owns_item(user_id: str, item_id: str) -> dict | None:
 def insert_item(list_id: str, fields: dict) -> dict:
     now = utc_now()
     item_id = str(uuid4())
-    with _lock, connect() as conn:
+    with connect() as conn:
         conn.execute(
             """
             INSERT INTO items (
@@ -600,7 +880,7 @@ def update_item(item_id: str, fields: dict) -> dict | None:
         return current
     changes["updated_at"] = utc_now()
     assignments = ", ".join(f"{key} = ?" for key in changes)
-    with _lock, connect() as conn:
+    with connect() as conn:
         conn.execute(
             f"UPDATE items SET {assignments} WHERE id = ?",
             (*changes.values(), item_id),
@@ -620,7 +900,7 @@ def row_to_category(row) -> dict:
 
 
 def list_categories(list_id: str) -> list[dict]:
-    with _lock, connect() as conn:
+    with connect() as conn:
         rows = conn.execute(
             "SELECT * FROM categories WHERE list_id = ? ORDER BY position ASC, created_at ASC",
             (list_id,),
@@ -629,7 +909,7 @@ def list_categories(list_id: str) -> list[dict]:
 
 
 def get_category(category_id: str) -> dict | None:
-    with _lock, connect() as conn:
+    with connect() as conn:
         row = conn.execute("SELECT * FROM categories WHERE id = ?", (category_id,)).fetchone()
     return row_to_category(row) if row else None
 
@@ -637,7 +917,7 @@ def get_category(category_id: str) -> dict | None:
 def create_category(list_id: str, name: str) -> dict:
     now = utc_now()
     category_id = str(uuid4())
-    with _lock, connect() as conn:
+    with connect() as conn:
         current = _count(conn.execute("SELECT COUNT(*) AS n FROM categories WHERE list_id = ?", (list_id,)).fetchone())
         conn.execute(
             "INSERT INTO categories (id, list_id, name, position, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
@@ -650,7 +930,7 @@ def create_category(list_id: str, name: str) -> dict:
 
 def rename_category(category_id: str, name: str) -> dict | None:
     now = utc_now()
-    with _lock, connect() as conn:
+    with connect() as conn:
         cursor = conn.execute(
             "UPDATE categories SET name = ?, updated_at = ? WHERE id = ?",
             (name, now, category_id),
@@ -661,7 +941,7 @@ def rename_category(category_id: str, name: str) -> dict | None:
 
 
 def delete_category(category_id: str) -> bool:
-    with _lock, connect() as conn:
+    with connect() as conn:
         conn.execute("UPDATE items SET category_id = NULL WHERE category_id = ?", (category_id,))
         cursor = conn.execute("DELETE FROM categories WHERE id = ?", (category_id,))
         return cursor.rowcount > 0
@@ -669,7 +949,7 @@ def delete_category(category_id: str) -> bool:
 
 def reorder_categories(list_id: str, ids: list[str]) -> list[dict]:
     now = utc_now()
-    with _lock, connect() as conn:
+    with connect() as conn:
         rows = conn.execute("SELECT id FROM categories WHERE list_id = ?", (list_id,)).fetchall()
         existing = {row["id"] for row in rows}
         if set(ids) != existing:
@@ -687,13 +967,13 @@ def labels_for_users(user_ids: list[str]) -> dict[str, str]:
     if not unique:
         return {}
     marks = ", ".join("?" for _ in unique)
-    with _lock, connect() as conn:
+    with connect() as conn:
         rows = conn.execute(f"SELECT id, email FROM users WHERE id IN ({marks})", tuple(unique)).fetchall()
     return {row["id"]: person_label(row["email"]) for row in rows}
 
 
 def list_members(list_id: str) -> list[dict]:
-    with _lock, connect() as conn:
+    with connect() as conn:
         return _member_rows(conn, list_id)
 
 
@@ -701,7 +981,7 @@ def add_member(list_id: str, user_id: str, role: str) -> None:
     if role not in {"editor", "viewer"}:
         raise ValueError("Escolha Pode editar ou Só pode ver.")
     now = utc_now()
-    with _lock, connect() as conn:
+    with connect() as conn:
         existing = conn.execute(
             "SELECT id, role FROM list_members WHERE list_id = ? AND user_id = ?",
             (list_id, user_id),
@@ -720,7 +1000,7 @@ def add_member(list_id: str, user_id: str, role: str) -> None:
 def set_member_role(list_id: str, user_id: str, role: str) -> bool:
     if role not in {"editor", "viewer"}:
         raise ValueError("Escolha Pode editar ou Só pode ver.")
-    with _lock, connect() as conn:
+    with connect() as conn:
         cursor = conn.execute(
             "UPDATE list_members SET role = ? WHERE list_id = ? AND user_id = ? AND role != 'owner'",
             (role, list_id, user_id),
@@ -729,7 +1009,7 @@ def set_member_role(list_id: str, user_id: str, role: str) -> bool:
 
 
 def remove_member(list_id: str, user_id: str) -> bool:
-    with _lock, connect() as conn:
+    with connect() as conn:
         cursor = conn.execute(
             "DELETE FROM list_members WHERE list_id = ? AND user_id = ? AND role != 'owner'",
             (list_id, user_id),
@@ -738,7 +1018,7 @@ def remove_member(list_id: str, user_id: str) -> bool:
 
 
 def invite_code_taken(code: str) -> bool:
-    with _lock, connect() as conn:
+    with connect() as conn:
         row = conn.execute(
             "SELECT 1 FROM lists WHERE invite_editor_code = ? OR invite_viewer_code = ?",
             (code, code),
@@ -756,7 +1036,7 @@ def set_invite_code(list_id: str, role: str, code: str | None) -> bool:
     else:
         raise ValueError("Escolha Pode editar ou Só pode ver.")
     now = utc_now()
-    with _lock, connect() as conn:
+    with connect() as conn:
         if code:
             clash = conn.execute(
                 f"SELECT id FROM lists WHERE ({column} = ? OR {other} = ?) AND NOT (id = ? AND {column} = ?)",
@@ -772,7 +1052,7 @@ def set_invite_code(list_id: str, role: str, code: str | None) -> bool:
 
 
 def get_invite(code: str) -> dict | None:
-    with _lock, connect() as conn:
+    with connect() as conn:
         row = conn.execute(
             "SELECT * FROM lists WHERE invite_editor_code = ? OR invite_viewer_code = ?",
             (code, code),
@@ -797,7 +1077,7 @@ def delete_item(item_id: str) -> bool:
     current = get_item(item_id)
     if current is None:
         return False
-    with _lock, connect() as conn:
+    with connect() as conn:
         cursor = conn.execute("DELETE FROM items WHERE id = ?", (item_id,))
         conn.execute("UPDATE lists SET updated_at = ? WHERE id = ?", (utc_now(), current["list_id"]))
         return cursor.rowcount > 0

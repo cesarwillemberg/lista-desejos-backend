@@ -1,0 +1,19 @@
+# GitHub schedules are best-effort: a */10 cron often starts late, and a
+# busy queue can skip a run. This only reduces Render free-tier cold starts.
+name: Keep the API awake
+
+on:
+  schedule:
+    - cron: "*/10 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - name: Ping /api/health
+        run: curl --fail --silent --show-error --max-time 60 --retry 2 --retry-delay 5 https://lista-desejos-backend.onrender.com/api/health
