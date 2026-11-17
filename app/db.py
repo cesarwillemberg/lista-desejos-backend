@@ -148,7 +148,7 @@ def row_to_user(row) -> dict:
     return {"id": row["id"], "email": row["email"], "created_at": row["created_at"]}
 
 
-def _bucket_totals(items: list[dict]) -> list[dict]:
+def money_totals(items: list[dict]) -> list[dict]:
     buckets: dict[str, float] = {}
     for item in items:
         if item["price"] is None:
@@ -173,8 +173,8 @@ def row_to_list(row, items: list[dict] | None = None) -> dict:
         "short_code": row["short_code"],
         "item_count": len(rows),
         "unpriced_count": sum(1 for item in remaining if item["price"] is None),
-        "totals": _bucket_totals(remaining),
-        "purchased_totals": _bucket_totals(bought),
+        "totals": money_totals(remaining),
+        "purchased_totals": money_totals(bought),
         "created_at": row["created_at"],
         "updated_at": row["updated_at"],
     }

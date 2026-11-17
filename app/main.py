@@ -11,6 +11,7 @@ import re
 import secrets
 from collections import OrderedDict
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 from pathlib import Path
 from threading import Lock
 
@@ -97,7 +98,7 @@ def _split_totals(items: list[dict]) -> tuple[list[dict], list[dict], int]:
     remaining = [item for item in items if not item.get("purchased")]
     bought = [item for item in items if item.get("purchased")]
     unpriced = sum(1 for item in remaining if item["price"] is None)
-    return db._bucket_totals(remaining), db._bucket_totals(bought), unpriced
+    return db.money_totals(remaining), db.money_totals(bought), unpriced
 
 
 _EMAIL = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
@@ -785,8 +786,6 @@ def patch_item(item_id: str, body: ItemUpdate, user: dict = Depends(current_user
     if "category_id" in sent:
         changes["category_id"] = _category_on_list(current["list_id"], body.category_id)
     if "purchased" in sent:
-        from datetime import datetime, timezone
-
         if body.purchased:
             changes["purchased"] = 1
             changes["purchased_at"] = datetime.now(timezone.utc).isoformat()
@@ -857,8 +856,6 @@ def member_reserve(item_id: str, body: ReserveBody, user: dict = Depends(current
     item = _access_item(item_id, user, "viewer")
     if item["reserved"]:
         raise HTTPException(409, "Alguém já marcou este item.")
-    from datetime import datetime, timezone
-
     label = " ".join((body.name or "").split())[:80] or db.person_label(user["email"])
     updated = db.update_item(
         item_id,
@@ -926,8 +923,6 @@ def reserve_item(token: str, item_id: str, body: ReserveBody):
     label = " ".join((body.name or "").split())[:80] or None
     claim = secrets.token_urlsafe(24)
     digest = hashlib.sha256(claim.encode()).hexdigest()
-    from datetime import datetime, timezone
-
     db.update_item(
         item_id,
         {
