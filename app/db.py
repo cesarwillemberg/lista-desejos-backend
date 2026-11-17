@@ -161,7 +161,9 @@ def row_to_list(row, items: list[dict] | None = None) -> dict:
     return {
         "id": row["id"],
         "name": row["name"],
+        "user_id": row["user_id"],
         "share_token": row["share_token"],
+        "short_code": row["short_code"],
         "item_count": len(items or []),
         "unpriced_count": sum(1 for item in (items or []) if item["price"] is None),
         "totals": totals,
@@ -174,6 +176,7 @@ def row_to_item(row) -> dict:
     return {
         "id": row["id"],
         "list_id": row["list_id"],
+        "category_id": row["category_id"] if "category_id" in row.keys() else None,
         "name": row["name"],
         "url": row["url"],
         "image_url": row["image_url"],
@@ -352,12 +355,31 @@ def delete_list(list_id: str, user_id: str) -> bool:
         return cursor.rowcount > 0
 
 
-def set_share_token(list_id: str, user_id: str, token: str | None) -> dict | None:
+def short_code_taken(code: str, *, except_list_id: str | None = None) -> bool:
+    with _lock, connect() as conn:
+        if except_list_id:
+            row = conn.execute(
+                "SELECT 1 FROM lists WHERE short_code = ? AND id != ?",
+                (code, except_list_id),
+            ).fetchone()
+        else:
+            row = conn.execute("SELECT 1 FROM lists WHERE short_code = ?", (code,)).fetchone()
+    return row is not None
+
+
+def set_share(list_id: str, user_id: str, token: str | None, code: str | None) -> dict | None:
     now = utc_now()
     with _lock, connect() as conn:
+        if code:
+            clash = conn.execute(
+                "SELECT id FROM lists WHERE short_code = ? AND id != ?",
+                (code, list_id),
+            ).fetchone()
+            if clash:
+                raise ValueError("Esse código curto já está em uso.")
         cursor = conn.execute(
-            "UPDATE lists SET share_token = ?, updated_at = ? WHERE id = ? AND user_id = ?",
-            (token, now, list_id, user_id),
+            "UPDATE lists SET share_token = ?, short_code = ?, updated_at = ? WHERE id = ? AND user_id = ?",
+            (token, code, now, list_id, user_id),
         )
         if cursor.rowcount == 0:
             return None
@@ -366,7 +388,10 @@ def set_share_token(list_id: str, user_id: str, token: str | None) -> dict | Non
 
 def get_list_by_share_token(token: str) -> dict | None:
     with _lock, connect() as conn:
-        row = conn.execute("SELECT * FROM lists WHERE share_token = ?", (token,)).fetchone()
+        row = conn.execute(
+            "SELECT * FROM lists WHERE short_code = ? OR share_token = ?",
+            (token, token),
+        ).fetchone()
         if row is None:
             return None
         items = [
@@ -416,14 +441,15 @@ def insert_item(list_id: str, fields: dict) -> dict:
         conn.execute(
             """
             INSERT INTO items (
-              id, list_id, name, url, image_url, price, currency, store, status, message,
+              id, list_id, category_id, name, url, image_url, price, currency, store, status, message,
               image_source, price_source, reserved_label, reserved_token_hash, reserved_at,
               created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 item_id,
                 list_id,
+                fields.get("category_id"),
                 fields["name"],
                 fields["url"],
                 fields.get("image_url"),
@@ -462,6 +488,7 @@ def update_item(item_id: str, fields: dict) -> dict | None:
         "message",
         "image_source",
         "price_source",
+        "category_id",
         "reserved_label",
         "reserved_token_hash",
         "reserved_at",
@@ -477,6 +504,80 @@ def update_item(item_id: str, fields: dict) -> dict | None:
             (*changes.values(), item_id),
         )
     return get_item(item_id)
+
+
+def row_to_category(row) -> dict:
+    return {
+        "id": row["id"],
+        "list_id": row["list_id"],
+        "name": row["name"],
+        "position": int(row["position"]),
+        "created_at": row["created_at"],
+        "updated_at": row["updated_at"],
+    }
+
+
+def list_categories(list_id: str) -> list[dict]:
+    with _lock, connect() as conn:
+        rows = conn.execute(
+            "SELECT * FROM categories WHERE list_id = ? ORDER BY position ASC, created_at ASC",
+            (list_id,),
+        ).fetchall()
+    return [row_to_category(row) for row in rows]
+
+
+def get_category(category_id: str) -> dict | None:
+    with _lock, connect() as conn:
+        row = conn.execute("SELECT * FROM categories WHERE id = ?", (category_id,)).fetchone()
+    return row_to_category(row) if row else None
+
+
+def create_category(list_id: str, name: str) -> dict:
+    now = utc_now()
+    category_id = str(uuid4())
+    with _lock, connect() as conn:
+        current = _count(conn.execute("SELECT COUNT(*) AS n FROM categories WHERE list_id = ?", (list_id,)).fetchone())
+        conn.execute(
+            "INSERT INTO categories (id, list_id, name, position, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
+            (category_id, list_id, name, current, now, now),
+        )
+    found = get_category(category_id)
+    assert found is not None
+    return found
+
+
+def rename_category(category_id: str, name: str) -> dict | None:
+    now = utc_now()
+    with _lock, connect() as conn:
+        cursor = conn.execute(
+            "UPDATE categories SET name = ?, updated_at = ? WHERE id = ?",
+            (name, now, category_id),
+        )
+        if cursor.rowcount == 0:
+            return None
+    return get_category(category_id)
+
+
+def delete_category(category_id: str) -> bool:
+    with _lock, connect() as conn:
+        conn.execute("UPDATE items SET category_id = NULL WHERE category_id = ?", (category_id,))
+        cursor = conn.execute("DELETE FROM categories WHERE id = ?", (category_id,))
+        return cursor.rowcount > 0
+
+
+def reorder_categories(list_id: str, ids: list[str]) -> list[dict]:
+    now = utc_now()
+    with _lock, connect() as conn:
+        rows = conn.execute("SELECT id FROM categories WHERE list_id = ?", (list_id,)).fetchall()
+        existing = {row["id"] for row in rows}
+        if set(ids) != existing:
+            raise ValueError("A ordem precisa incluir todas as categorias da lista.")
+        for position, category_id in enumerate(ids):
+            conn.execute(
+                "UPDATE categories SET position = ?, updated_at = ? WHERE id = ? AND list_id = ?",
+                (position, now, category_id, list_id),
+            )
+    return list_categories(list_id)
 
 
 def delete_item(item_id: str) -> bool:

@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import html
+import json
 import os
 import re
 import secrets
@@ -23,6 +25,7 @@ from app import db
 from app.auth import current_user, hash_password, issue_token, jwt_secret, verify_password
 from app.extractor import extract_product, store_name
 from app.fetch import ensure_public_url, fetch_image
+from app.share_codes import new_short_code
 
 _image_cache: OrderedDict[tuple[str, str], tuple[bytes, str]] = OrderedDict()
 _image_lock = Lock()
@@ -45,10 +48,21 @@ class ReserveBody(BaseModel):
     name: str | None = None
 
 
+class CategoryBody(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+    name: str
+
+
+class CategoryOrder(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+    ids: list[str]
+
+
 class ItemCreate(BaseModel):
     model_config = ConfigDict(extra="ignore")
     name: str
     url: str
+    category_id: str | None = None
 
 
 class ItemUpdate(BaseModel):
@@ -57,6 +71,7 @@ class ItemUpdate(BaseModel):
     image_url: str | None = None
     price: float | None = None
     currency: str | None = None
+    category_id: str | None = None
 
 
 def _web_dir() -> Path:
@@ -98,12 +113,42 @@ def _clean_password(value: str) -> str:
     return value
 
 
-def _present_list(payload: dict) -> dict:
+def _short_base(request: Request) -> str:
+    configured = (os.environ.get("PUBLIC_SHORT_BASE") or "").strip().rstrip("/")
+    if configured:
+        return configured
+    return str(request.base_url).rstrip("/")
+
+
+def _web_base() -> str:
+    return (os.environ.get("PUBLIC_WEB_BASE") or "https://cesarwillemberg.github.io/lista-desejos-frontend").rstrip("/")
+
+
+def _owner_label(email: str | None) -> str:
+    if not email or "@" not in email:
+        return "alguém"
+    name = email.split("@", 1)[0].replace(".", " ").replace("_", " ").strip()
+    return name[:1].upper() + name[1:] if name else "alguém"
+
+
+def _present_list(payload: dict, request: Request | None = None) -> dict:
     data = dict(payload)
     data.pop("items", None)
+    data.pop("user_id", None)
+    code = data.get("short_code")
     token = data.get("share_token")
-    data["share_path"] = f"/l/{token}" if token else None
+    public_id = code or token
+    data["share_path"] = f"/l/{public_id}" if public_id else None
+    data["short_url"] = f"{_short_base(request)}/s/{code}" if request is not None and code else None
     return data
+
+
+def _fresh_short_code(list_id: str) -> str:
+    for _ in range(12):
+        code = new_short_code()
+        if not db.short_code_taken(code, except_list_id=list_id):
+            return code
+    raise HTTPException(500, "Não foi possível gerar um código curto.")
 
 
 def _present_item(item: dict, *, owner: bool, mine: bool) -> dict:
@@ -146,6 +191,22 @@ def _require_list(list_id: str, user: dict) -> dict:
     if found is None:
         raise HTTPException(404, "Lista não encontrada.")
     return found
+
+
+def _require_category(category_id: str, user: dict) -> dict:
+    category = db.get_category(category_id)
+    if category is None or db.get_owned_list(category["list_id"], user["id"]) is None:
+        raise HTTPException(404, "Categoria não encontrada.")
+    return category
+
+
+def _category_on_list(list_id: str, category_id: str | None) -> str | None:
+    if category_id is None or not str(category_id).strip():
+        return None
+    category = db.get_category(category_id)
+    if category is None or category["list_id"] != list_id:
+        raise HTTPException(400, "Escolha uma categoria desta lista.")
+    return category["id"]
 
 
 def _require_item(item_id: str, user: dict) -> dict:
@@ -233,6 +294,77 @@ def health():
     return {"ok": True, "database": db.engine_name()}
 
 
+@app.get("/.well-known/assetlinks.json")
+def asset_links():
+    package = (os.environ.get("ANDROID_PACKAGE") or "com.quero.quero").strip()
+    raw = os.environ.get("ANDROID_SHA256_FINGERPRINTS") or ""
+    fingerprints = [item.strip() for item in raw.split(",") if item.strip()]
+    if not fingerprints:
+        fingerprints = ["REPLACE_WITH_SHA256_FINGERPRINT"]
+    return JSONResponse(
+        [
+            {
+                "relation": ["delegate_permission/common.handle_all_urls"],
+                "target": {
+                    "namespace": "android_app",
+                    "package_name": package,
+                    "sha256_cert_fingerprints": fingerprints,
+                },
+            }
+        ]
+    )
+
+
+@app.get("/.well-known/apple-app-site-association")
+def apple_app_site_association():
+    app_id = (os.environ.get("IOS_APP_ID") or "TEAMID.com.quero.quero").strip()
+    return JSONResponse(
+        {
+            "applinks": {
+                "apps": [],
+                "details": [{"appID": app_id, "paths": ["/s/*"]}],
+            }
+        }
+    )
+
+
+@app.get("/s/{code}")
+def short_link(code: str, request: Request):
+    found = db.get_list_by_share_token(code)
+    if found is None:
+        page = "<!doctype html><html lang='pt-BR'><head><meta charset='utf-8'><title>Link indisponível</title></head><body><p>Esse link não está mais disponível.</p></body></html>"
+        return Response(page, status_code=404, media_type="text/html; charset=utf-8")
+    public_id = found.get("short_code") or code
+    target = f"{_web_base()}/#/l/{public_id}"
+    owner = _owner_label((db.get_user(found["user_id"]) or {}).get("email"))
+    title = found["name"]
+    description = f"Lista de {owner} no Quero"
+    image = ""
+    for item in found.get("items") or []:
+        if item.get("image_url"):
+            image = f"{_short_base(request)}/api/share/{public_id}/items/{item['id']}/image"
+            break
+    image_tag = f'<meta property="og:image" content="{html.escape(image, quote=True)}">' if image else ""
+    page = f"""<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<title>{html.escape(title)} — Quero</title>
+<meta property="og:type" content="website">
+<meta property="og:title" content="{html.escape(title, quote=True)}">
+<meta property="og:description" content="{html.escape(description, quote=True)}">
+<meta property="og:url" content="{html.escape(_short_base(request) + '/s/' + public_id, quote=True)}">
+{image_tag}
+<meta http-equiv="refresh" content="0;url={html.escape(target, quote=True)}">
+<script>location.replace({json.dumps(target)});</script>
+</head>
+<body>
+<p>Abrindo a lista… <a href="{html.escape(target, quote=True)}">Continuar</a></p>
+</body>
+</html>"""
+    return Response(page, media_type="text/html; charset=utf-8")
+
+
 @app.post("/api/auth/register", status_code=201)
 def register(body: AuthBody):
     email = _clean_email(body.email)
@@ -257,21 +389,21 @@ def me(user: dict = Depends(current_user)):
 
 
 @app.get("/api/lists")
-def get_lists(user: dict = Depends(current_user)):
-    return {"lists": [_present_list(item) for item in db.lists_for_user(user["id"])]}
+def get_lists(request: Request, user: dict = Depends(current_user)):
+    return {"lists": [_present_list(item, request) for item in db.lists_for_user(user["id"])]}
 
 
 @app.post("/api/lists", status_code=201)
-def post_list(body: ListBody, user: dict = Depends(current_user)):
-    return _present_list(db.create_list(user["id"], _clean_name(body.name)))
+def post_list(body: ListBody, request: Request, user: dict = Depends(current_user)):
+    return _present_list(db.create_list(user["id"], _clean_name(body.name)), request)
 
 
 @app.patch("/api/lists/{list_id}")
-def patch_list(list_id: str, body: ListBody, user: dict = Depends(current_user)):
+def patch_list(list_id: str, body: ListBody, request: Request, user: dict = Depends(current_user)):
     updated = db.rename_list(list_id, user["id"], _clean_name(body.name))
     if updated is None:
         raise HTTPException(404, "Lista não encontrada.")
-    return _present_list(updated)
+    return _present_list(updated, request)
 
 
 @app.delete("/api/lists/{list_id}", status_code=204)
@@ -285,35 +417,85 @@ def _new_share_token() -> str:
     return secrets.token_urlsafe(18)
 
 
+def _save_share(list_id: str, user_id: str, token: str | None, code: str | None):
+    try:
+        updated = db.set_share(list_id, user_id, token, code)
+    except ValueError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    if updated is None:
+        raise HTTPException(404, "Lista não encontrada.")
+    return updated
+
+
 @app.post("/api/lists/{list_id}/share")
-def create_share(list_id: str, user: dict = Depends(current_user)):
+def create_share(list_id: str, request: Request, user: dict = Depends(current_user)):
     current = _require_list(list_id, user)
-    if current["share_token"]:
-        return _present_list(current)
-    updated = db.set_share_token(list_id, user["id"], _new_share_token())
-    return _present_list(updated)
+    token = current["share_token"] or _new_share_token()
+    code = current["short_code"] or _fresh_short_code(list_id)
+    if token == current["share_token"] and code == current["short_code"]:
+        return _present_list(current, request)
+    updated = _save_share(list_id, user["id"], token, code)
+    return _present_list(updated, request)
 
 
 @app.post("/api/lists/{list_id}/share/regenerate")
-def regenerate_share(list_id: str, user: dict = Depends(current_user)):
+def regenerate_share(list_id: str, request: Request, user: dict = Depends(current_user)):
     _require_list(list_id, user)
-    updated = db.set_share_token(list_id, user["id"], _new_share_token())
-    return _present_list(updated)
+    updated = _save_share(list_id, user["id"], _new_share_token(), _fresh_short_code(list_id))
+    return _present_list(updated, request)
 
 
 @app.delete("/api/lists/{list_id}/share", status_code=200)
-def revoke_share(list_id: str, user: dict = Depends(current_user)):
+def revoke_share(list_id: str, request: Request, user: dict = Depends(current_user)):
     _require_list(list_id, user)
-    updated = db.set_share_token(list_id, user["id"], None)
-    return _present_list(updated)
+    updated = _save_share(list_id, user["id"], None, None)
+    return _present_list(updated, request)
 
 
 @app.get("/api/lists/{list_id}/items")
-def get_items(list_id: str, user: dict = Depends(current_user)):
+def get_items(list_id: str, request: Request, user: dict = Depends(current_user)):
     found = _require_list(list_id, user)
     items = [_present_item(item, owner=True, mine=False) for item in db.list_items(list_id)]
     totals, unpriced = _totals(items)
-    return {"list": _present_list(found), "items": items, "totals": totals, "unpriced_count": unpriced}
+    return {
+        "list": _present_list(found, request),
+        "categories": db.list_categories(list_id),
+        "items": items,
+        "totals": totals,
+        "unpriced_count": unpriced,
+    }
+
+
+@app.post("/api/lists/{list_id}/categories", status_code=201)
+def post_category(list_id: str, body: CategoryBody, user: dict = Depends(current_user)):
+    _require_list(list_id, user)
+    return db.create_category(list_id, _clean_name(body.name))
+
+
+@app.patch("/api/categories/{category_id}")
+def patch_category(category_id: str, body: CategoryBody, user: dict = Depends(current_user)):
+    _require_category(category_id, user)
+    updated = db.rename_category(category_id, _clean_name(body.name))
+    if updated is None:
+        raise HTTPException(404, "Categoria não encontrada.")
+    return updated
+
+
+@app.delete("/api/categories/{category_id}", status_code=204)
+def remove_category(category_id: str, user: dict = Depends(current_user)):
+    _require_category(category_id, user)
+    if not db.delete_category(category_id):
+        raise HTTPException(404, "Categoria não encontrada.")
+    return Response(status_code=204)
+
+
+@app.post("/api/lists/{list_id}/categories/reorder")
+def reorder_categories(list_id: str, body: CategoryOrder, user: dict = Depends(current_user)):
+    _require_list(list_id, user)
+    try:
+        return {"categories": db.reorder_categories(list_id, body.ids)}
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
 
 
 @app.post("/api/lists/{list_id}/items", status_code=201)
@@ -325,7 +507,15 @@ def create_item(list_id: str, body: ItemCreate, user: dict = Depends(current_use
         raise HTTPException(400, "Esse link é longo demais.")
     ensure_public_url(url)
     extracted = extract_product(url)
-    item = db.insert_item(list_id, {"name": name, "url": url, **_fields_from_extraction(extracted, url)})
+    item = db.insert_item(
+        list_id,
+        {
+            "name": name,
+            "url": url,
+            "category_id": _category_on_list(list_id, body.category_id),
+            **_fields_from_extraction(extracted, url),
+        },
+    )
     return _present_item(item, owner=True, mine=False)
 
 
@@ -358,20 +548,23 @@ def patch_item(item_id: str, body: ItemUpdate, user: dict = Depends(current_user
             changes["price_source"] = "manual"
     if "currency" in sent:
         changes["currency"] = _clean_currency(body.currency)
+    if "category_id" in sent:
+        changes["category_id"] = _category_on_list(current["list_id"], body.category_id)
     if not changes:
-        return current
+        return _present_item(current, owner=True, mine=False)
+    content_changed = any(key in changes for key in ("image_url", "price", "currency"))
     image = changes["image_url"] if "image_url" in changes else current["image_url"]
     price = changes["price"] if "price" in changes else current["price"]
-    if image and price is not None:
+    if content_changed and image and price is not None:
         changes["status"] = "ok"
         changes["message"] = None
-    elif image or price is not None:
+    elif content_changed and (image or price is not None):
         changes["status"] = "partial"
         if price is None:
             changes["message"] = "Preço informado manualmente ainda está vazio."
         else:
             changes["message"] = "Foto informada manualmente ainda está vazia."
-    else:
+    elif content_changed:
         changes["status"] = "failed"
         changes["message"] = "Foto e preço não informados."
     updated = db.update_item(item_id, changes)
@@ -441,6 +634,7 @@ def share_view(token: str, x_claims: str | None = Header(default=None)):
     totals, unpriced = _totals(items)
     return {
         "list": {"name": found["name"], "share_path": found.get("share_path") or f"/l/{token}"},
+        "categories": db.list_categories(found["id"]),
         "items": items,
         "totals": totals,
         "unpriced_count": unpriced,

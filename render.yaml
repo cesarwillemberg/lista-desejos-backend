@@ -29,5 +29,15 @@ services:
         value: https://cesarwillemberg.github.io
       - key: JWT_SECRET
         generateValue: true
+      - key: PUBLIC_WEB_BASE
+        value: https://cesarwillemberg.github.io/lista-desejos-frontend
+      - key: PUBLIC_SHORT_BASE
+        value: https://lista-desejos-backend.onrender.com
+      - key: ANDROID_PACKAGE
+        value: com.quero.quero
+      - key: ANDROID_SHA256_FINGERPRINTS
+        value: ""
+      - key: IOS_APP_ID
+        value: TEAMID.com.quero.quero
       - key: PYTHONUNBUFFERED
         value: "1"

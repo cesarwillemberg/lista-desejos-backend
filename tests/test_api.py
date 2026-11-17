@@ -85,8 +85,20 @@ def test_share_link_is_read_only_and_can_be_revoked(client, monkeypatch):
 
     shared = client.post(f"/api/lists/{list_id}/share", headers=headers).json()
     token = shared["share_token"]
-    assert shared["share_path"] == f"/l/{token}"
+    code = shared["short_code"]
+    assert len(code) == 7
+    assert shared["share_path"] == f"/l/{code}"
+    assert shared["short_url"].endswith(f"/s/{code}")
     public = client.get(f"/api/share/{token}")
+    assert public.status_code == 200
+    by_code = client.get(f"/api/share/{code}")
+    assert by_code.status_code == 200
+    page = client.get(f"/s/{code}")
+    assert page.status_code == 200
+    assert "og:title" in page.text
+    assert "og:description" in page.text
+    assert f"#/l/{code}" in page.text
+    assert client.get(f"/s/{token}").status_code == 200
     assert public.status_code == 200
     assert public.json()["items"][0]["name"] == "PS5"
     assert public.json()["items"][0]["reserved_label"] is None
@@ -118,10 +130,90 @@ def test_share_link_is_read_only_and_can_be_revoked(client, monkeypatch):
 
     regenerated = client.post(f"/api/lists/{list_id}/share/regenerate", headers=headers).json()
     assert regenerated["share_token"] != token
+    assert regenerated["short_code"] != code
     assert client.get(f"/api/share/{token}").status_code == 404
+    assert client.get(f"/s/{code}").status_code == 404
+    assert client.get(f"/s/{regenerated['short_code']}").status_code == 200
     revoked = client.delete(f"/api/lists/{list_id}/share", headers=headers).json()
     assert revoked["share_token"] is None
+    assert revoked["short_code"] is None
     assert client.get(f"/api/share/{regenerated['share_token']}").status_code == 404
+    assert client.get(f"/s/{regenerated['short_code']}").status_code == 404
+
+
+def test_short_code_skips_collisions(client, monkeypatch):
+    headers, _user = _auth(client, "codes@example.com")
+    lists = client.get("/api/lists", headers=headers).json()["lists"]
+    other = client.post("/api/lists", json={"name": "Outra"}, headers=headers).json()
+    first = client.post(f"/api/lists/{lists[0]['id']}/share", headers=headers).json()
+    taken = first["short_code"]
+    calls = {"n": 0}
+
+    def fake_code():
+        calls["n"] += 1
+        return taken if calls["n"] == 1 else "Zz99abc"
+
+    monkeypatch.setattr("app.main.new_short_code", fake_code)
+    second = client.post(f"/api/lists/{other['id']}/share", headers=headers).json()
+    assert second["short_code"] == "Zz99abc"
+    assert calls["n"] >= 2
+
+
+def test_categories_belong_to_a_list_and_delete_clears_items(client, monkeypatch):
+    monkeypatch.setattr("app.main.extract_product", lambda url: _ok(url))
+    headers, _user = _auth(client, "casa@example.com")
+    other, _user = _auth(client, "vizinho@example.com")
+    list_id = client.get("/api/lists", headers=headers).json()["lists"][0]["id"]
+    sala = client.post(f"/api/lists/{list_id}/categories", json={"name": "Sala"}, headers=headers)
+    cozinha = client.post(f"/api/lists/{list_id}/categories", json={"name": "Cozinha"}, headers=headers)
+    assert sala.status_code == 201
+    sala_id = sala.json()["id"]
+    cozinha_id = cozinha.json()["id"]
+    assert sala.json()["position"] == 0
+    assert cozinha.json()["position"] == 1
+    lamp = client.post(
+        f"/api/lists/{list_id}/items",
+        json={"name": "Luminária", "url": "https://www.kabum.com.br/produto/1", "category_id": sala_id},
+        headers=headers,
+    )
+    assert lamp.status_code == 201
+    assert lamp.json()["category_id"] == sala_id
+    loose = client.post(
+        f"/api/lists/{list_id}/items",
+        json={"name": "Cabo", "url": "https://www.kabum.com.br/produto/2"},
+        headers=headers,
+    )
+    assert loose.json()["category_id"] is None
+    ordered = client.post(
+        f"/api/lists/{list_id}/categories/reorder",
+        json={"ids": [cozinha_id, sala_id]},
+        headers=headers,
+    )
+    assert [item["id"] for item in ordered.json()["categories"]] == [cozinha_id, sala_id]
+    renamed = client.patch(f"/api/categories/{sala_id}", json={"name": "Sala de estar"}, headers=headers)
+    assert renamed.json()["name"] == "Sala de estar"
+    assert client.delete(f"/api/categories/{sala_id}", headers=other).status_code == 404
+    assert client.delete(f"/api/categories/{sala_id}", headers=headers).status_code == 204
+    items = client.get(f"/api/lists/{list_id}/items", headers=headers).json()["items"]
+    assert all(item["category_id"] is None for item in items)
+    public = client.post(f"/api/lists/{list_id}/share", headers=headers).json()
+    shared = client.get(f"/api/share/{public['short_code']}").json()
+    assert "categories" in shared
+
+
+def test_well_known_links(client, monkeypatch):
+    monkeypatch.setenv("ANDROID_PACKAGE", "com.quero.quero")
+    monkeypatch.setenv("ANDROID_SHA256_FINGERPRINTS", "AA:BB, CC:DD")
+    monkeypatch.setenv("IOS_APP_ID", "TEAMID.com.quero.quero")
+    asset = client.get("/.well-known/assetlinks.json")
+    assert asset.status_code == 200
+    body = asset.json()
+    assert body[0]["target"]["package_name"] == "com.quero.quero"
+    assert body[0]["target"]["sha256_cert_fingerprints"] == ["AA:BB", "CC:DD"]
+    apple = client.get("/.well-known/apple-app-site-association")
+    assert apple.status_code == 200
+    assert apple.json()["applinks"]["details"][0]["paths"] == ["/s/*"]
+    assert apple.json()["applinks"]["details"][0]["appID"] == "TEAMID.com.quero.quero"
 
 
 def test_refresh_keeps_previous_when_fetch_fails(client, monkeypatch):

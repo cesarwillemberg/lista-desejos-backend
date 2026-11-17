@@ -27,6 +27,11 @@ export JWT_SECRET=dev-only-change-me-please
 | `QUERO_WEB_DIR` | `../frontend/build/web` when that folder exists | Optional Flutter web build served on `/` |
 | `DATABASE_URL` | unset | Postgres URL (`postgres://` or `postgresql://`). When set, SQLite is not used |
 | `JWT_SECRET` | required | Signs login tokens. At least 16 characters. On Render, `render.yaml` generates it |
+| `PUBLIC_SHORT_BASE` | the request host | Origin of short links, no trailing slash. Production: `https://lista-desejos-backend.onrender.com` |
+| `PUBLIC_WEB_BASE` | the GitHub Pages URL | Where `/s/{code}` sends the browser. Default `https://cesarwillemberg.github.io/lista-desejos-frontend` |
+| `ANDROID_PACKAGE` | `com.quero.quero` | Package name inside `/.well-known/assetlinks.json` |
+| `ANDROID_SHA256_FINGERPRINTS` | placeholder | Comma-separated signing cert fingerprints. Until you set this, the file contains `REPLACE_WITH_SHA256_FINGERPRINT` |
+| `IOS_APP_ID` | `TEAMID.com.quero.quero` | Apple team id plus bundle id for `apple-app-site-association`. Replace `TEAMID` |
 | `CORS_ORIGINS` | `https://cesarwillemberg.github.io` | Comma-separated browser origins. Localhost is always allowed |
 
 ```bash
