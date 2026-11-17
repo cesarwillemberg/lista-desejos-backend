@@ -45,7 +45,10 @@ Accounts, lists, and items are created by Alembic (`alembic upgrade head` runs o
 
 - `POST /api/auth/register` and `POST /api/auth/login` — `{ "email", "password" }` returns a JWT (30 days). Send `Authorization: Bearer …`
 - `GET /api/auth/me`
-- `GET/POST /api/lists`, `PATCH/DELETE /api/lists/{id}`
+- `GET/POST /api/lists`, `PATCH/DELETE /api/lists/{id}` — a list is visible to its owner, editors (“Pode editar”) and viewers (“Só pode ver”). Editors change items and categories. Viewers can read and reserve. Only the owner renames, deletes, shares, or invites. Existing lists keep their owner when Alembic runs.
+- `POST /api/lists/{id}/members` with `{ "email", "role": "editor" | "viewer" }` adds an account that already exists. Otherwise the response asks the owner to send the invite link. No email is sent.
+- `PATCH/DELETE /api/lists/{id}/members/{user_id}` changes a role or removes someone. `POST /api/lists/{id}/leave` is how an editor or viewer leaves.
+- `POST /api/lists/{id}/invites/{role}`, `POST …/regenerate`, `DELETE …/{role}` manage two invite links. `GET /c/{code}` is the preview page. `POST /api/invites/{code}/accept` joins after login.
 - `POST /api/lists/{id}/share`, `POST …/share/regenerate`, `DELETE …/share`
 - `GET /api/share/{token}` — public read-only list. `POST/DELETE …/items/{id}/reservation` marks “Já comprei”
 - `GET/POST /api/lists/{id}/items`, plus `PATCH /api/items/{id}`, refresh, delete, and the image proxy

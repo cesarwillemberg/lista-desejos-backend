@@ -212,7 +212,7 @@ def test_well_known_links(client, monkeypatch):
     assert body[0]["target"]["sha256_cert_fingerprints"] == ["AA:BB", "CC:DD"]
     apple = client.get("/.well-known/apple-app-site-association")
     assert apple.status_code == 200
-    assert apple.json()["applinks"]["details"][0]["paths"] == ["/s/*"]
+    assert apple.json()["applinks"]["details"][0]["paths"] == ["/s/*", "/c/*"]
     assert apple.json()["applinks"]["details"][0]["appID"] == "TEAMID.com.quero.quero"
 
 
@@ -295,3 +295,186 @@ def test_first_user_adopts_legacy_items(tmp_path, monkeypatch):
         second_lists = client.get("/api/lists", headers=second).json()["lists"]
         second_items = client.get(f"/api/lists/{second_lists[0]['id']}/items", headers=second).json()["items"]
         assert second_items == []
+
+
+def test_existing_lists_gain_an_owner_membership(tmp_path, monkeypatch):
+    db_file = tmp_path / "existing.db"
+    monkeypatch.setenv("QUERO_DB", str(db_file))
+    monkeypatch.delenv("DATABASE_URL", raising=False)
+    from pathlib import Path
+
+    from alembic import command
+    from alembic.config import Config
+
+    from app import db as database
+
+    root = Path(database.__file__).resolve().parents[1]
+    cfg = Config(str(root / "alembic.ini"))
+    cfg.set_main_option("script_location", str(root / "alembic"))
+    cfg.set_main_option("sqlalchemy.url", database.sqlalchemy_url())
+    command.upgrade(cfg, "003_categories")
+    raw = sqlite3.connect(db_file)
+    raw.execute(
+        "INSERT INTO users (id, email, password_hash, created_at) VALUES (?, ?, ?, ?)",
+        ("user-1", "ana@example.com", "hash", "2026-01-01T00:00:00+00:00"),
+    )
+    raw.execute(
+        "INSERT INTO lists (id, user_id, name, share_token, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
+        ("list-1", "user-1", "Natal", None, "2026-01-01T00:00:00+00:00", "2026-01-01T00:00:00+00:00"),
+    )
+    raw.commit()
+    raw.close()
+    command.upgrade(cfg, "head")
+    raw = sqlite3.connect(db_file)
+    row = raw.execute("SELECT user_id, role FROM list_members WHERE list_id = ?", ("list-1",)).fetchone()
+    raw.close()
+    assert row == ("user-1", "owner")
+
+
+def test_collaboration_roles_invites_and_viewer_cannot_write(client, monkeypatch):
+    monkeypatch.setattr("app.main.extract_product", lambda url: _ok(url))
+    ana, _ana = _auth(client, "ana@example.com")
+    bia, bia_user = _auth(client, "bia@example.com")
+    caio, _caio = _auth(client, "caio@example.com")
+    list_id = client.get("/api/lists", headers=ana).json()["lists"][0]["id"]
+    assert client.get("/api/lists", headers=ana).json()["lists"][0]["role"] == "owner"
+    assert client.get("/api/lists", headers=ana).json()["lists"][0]["collaborative"] is False
+
+    missing = client.post(
+        f"/api/lists/{list_id}/members",
+        json={"email": "ninguem@example.com", "role": "editor"},
+        headers=ana,
+    )
+    assert missing.status_code == 404
+    assert "link de convite" in missing.json()["detail"]
+
+    added = client.post(
+        f"/api/lists/{list_id}/members",
+        json={"email": "bia@example.com", "role": "editor"},
+        headers=ana,
+    )
+    assert added.status_code == 200
+    assert {member["email"]: member["role"] for member in added.json()["members"]}["bia@example.com"] == "editor"
+    assert client.post(
+        f"/api/lists/{list_id}/members",
+        json={"email": "bia@example.com", "role": "editor"},
+        headers=bia,
+    ).status_code == 403
+
+    item = client.post(
+        f"/api/lists/{list_id}/items",
+        json={"name": "PS5", "url": "https://www.kabum.com.br/produto/1"},
+        headers=bia,
+    )
+    assert item.status_code == 201
+    assert item.json()["added_by_label"] == "Bia"
+    assert client.post(f"/api/lists/{list_id}/categories", json={"name": "Sala"}, headers=bia).status_code == 201
+    assert client.delete(f"/api/lists/{list_id}", headers=bia).status_code == 403
+    assert client.post(f"/api/lists/{list_id}/share", headers=bia).status_code == 403
+    assert client.patch(f"/api/lists/{list_id}", json={"name": "Outra"}, headers=bia).status_code == 403
+
+    stranger = client.post(
+        f"/api/lists/{list_id}/items",
+        json={"name": "X", "url": "https://www.kabum.com.br/produto/9"},
+        headers=caio,
+    )
+    assert stranger.status_code == 404
+    assert client.get(f"/api/lists/{list_id}/items", headers=caio).status_code == 404
+
+    viewed = client.post(
+        f"/api/lists/{list_id}/members",
+        json={"email": "caio@example.com", "role": "viewer"},
+        headers=ana,
+    )
+    assert viewed.status_code == 200
+    listed = client.get("/api/lists", headers=caio).json()["lists"]
+    assert listed[0]["id"] == list_id
+    assert listed[0]["role"] == "viewer"
+    assert listed[0]["collaborative"] is True
+    assert listed[0]["share_token"] is None
+    assert any(member["user_id"] == bia_user["id"] for member in listed[0]["members"])
+    seen = client.get(f"/api/lists/{list_id}/items", headers=caio)
+    assert seen.status_code == 200
+    assert seen.json()["categories"]
+    assert seen.json()["totals"]
+    assert client.post(
+        f"/api/lists/{list_id}/items",
+        json={"name": "Nope", "url": "https://www.kabum.com.br/produto/3"},
+        headers=caio,
+    ).status_code == 403
+    assert client.patch(f"/api/items/{item.json()['id']}", json={"name": "Mudou"}, headers=caio).status_code == 403
+    assert client.delete(f"/api/items/{item.json()['id']}", headers=caio).status_code == 403
+    category_id = seen.json()["categories"][0]["id"]
+    assert client.delete(f"/api/categories/{category_id}", headers=caio).status_code == 403
+
+    reserved = client.post(f"/api/items/{item.json()['id']}/reservation", json={"name": ""}, headers=caio)
+    assert reserved.status_code == 200
+    assert reserved.json()["reserved_by_me"] is True
+    assert client.delete(f"/api/items/{item.json()['id']}/reservation", headers=bia).status_code == 204
+
+    member_id = next(member["user_id"] for member in viewed.json()["members"] if member["email"] == "caio@example.com")
+    promoted = client.patch(
+        f"/api/lists/{list_id}/members/{member_id}",
+        json={"role": "editor"},
+        headers=ana,
+    )
+    assert promoted.status_code == 200
+    assert client.post(
+        f"/api/lists/{list_id}/items",
+        json={"name": "Agora", "url": "https://www.kabum.com.br/produto/4"},
+        headers=caio,
+    ).status_code == 201
+    demoted = client.patch(
+        f"/api/lists/{list_id}/members/{member_id}",
+        json={"role": "viewer"},
+        headers=ana,
+    )
+    assert demoted.status_code == 200
+    owner_id = next(member["user_id"] for member in demoted.json()["members"] if member["role"] == "owner")
+    assert client.patch(
+        f"/api/lists/{list_id}/members/{owner_id}",
+        json={"role": "viewer"},
+        headers=ana,
+    ).status_code == 404
+
+    editor_link = client.post(f"/api/lists/{list_id}/invites/editor", headers=ana).json()
+    viewer_link = client.post(f"/api/lists/{list_id}/invites/viewer", headers=ana).json()
+    editor_code = editor_link["invite_editor_url"].rstrip("/").split("/")[-1]
+    viewer_code = viewer_link["invite_viewer_url"].rstrip("/").split("/")[-1]
+    assert editor_code != viewer_code
+    assert len(editor_code) == 7
+    page = client.get(f"/c/{editor_code}")
+    assert page.status_code == 200
+    assert "og:title" in page.text
+    assert f"#/c/{editor_code}" in page.text
+    assert "pode editar" in page.text
+    view_page = client.get(f"/c/{viewer_code}")
+    assert "só pode ver" in view_page.text
+
+    dina, _dina = _auth(client, "dina@example.com")
+    preview = client.get(f"/api/invites/{editor_code}", headers=dina)
+    assert preview.json()["role"] == "editor"
+    accepted = client.post(f"/api/invites/{editor_code}/accept", headers=dina)
+    assert accepted.status_code == 200
+    assert accepted.json()["role"] == "editor"
+    assert client.get(f"/api/lists/{list_id}/items", headers=dina).status_code == 200
+
+    regenerated = client.post(f"/api/lists/{list_id}/invites/editor/regenerate", headers=ana).json()
+    new_editor = regenerated["invite_editor_url"].rstrip("/").split("/")[-1]
+    assert new_editor != editor_code
+    assert regenerated["invite_viewer_url"].endswith(viewer_code)
+    assert client.get(f"/c/{editor_code}").status_code == 404
+    assert client.post(f"/api/invites/{editor_code}/accept", headers=dina).status_code == 404
+    disabled = client.delete(f"/api/lists/{list_id}/invites/viewer", headers=ana).json()
+    assert disabled["invite_viewer_url"] is None
+    assert client.get(f"/c/{viewer_code}").status_code == 404
+    assert client.post(f"/api/lists/{list_id}/invites/editor/regenerate", headers=bia).status_code == 403
+
+    assert client.post(f"/api/lists/{list_id}/leave", headers=ana).status_code == 400
+    assert client.delete(f"/api/lists/{list_id}/members/{member_id}", headers=bia).status_code == 403
+    removed = client.delete(f"/api/lists/{list_id}/members/{member_id}", headers=ana)
+    assert removed.status_code == 200
+    assert client.get(f"/api/lists/{list_id}/items", headers=caio).status_code == 404
+    assert client.post(f"/api/lists/{list_id}/leave", headers=bia).status_code == 204
+    assert client.get(f"/api/lists/{list_id}/items", headers=bia).status_code == 404
+    assert client.get(f"/api/lists/{list_id}/items", headers=ana).status_code == 200

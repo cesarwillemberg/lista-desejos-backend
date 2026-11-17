@@ -74,6 +74,17 @@ class ItemUpdate(BaseModel):
     category_id: str | None = None
 
 
+class MemberBody(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+    email: str
+    role: str
+
+
+class RoleBody(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+    role: str
+
+
 def _web_dir() -> Path:
     configured = os.environ.get("QUERO_WEB_DIR")
     if configured:
@@ -135,12 +146,39 @@ def _present_list(payload: dict, request: Request | None = None) -> dict:
     data = dict(payload)
     data.pop("items", None)
     data.pop("user_id", None)
+    role = data.get("role") or "owner"
+    data["role"] = role
+    members = data.get("members") or []
+    data["members"] = members
+    data["collaborative"] = len(members) > 1
+    editor_code = data.pop("invite_editor_code", None)
+    viewer_code = data.pop("invite_viewer_code", None)
+    data.pop("invite_role", None)
     code = data.get("short_code")
     token = data.get("share_token")
     public_id = code or token
     data["share_path"] = f"/l/{public_id}" if public_id else None
     data["short_url"] = f"{_short_base(request)}/s/{code}" if request is not None and code else None
+    if role == "owner" and request is not None:
+        base = _short_base(request)
+        data["invite_editor_url"] = f"{base}/c/{editor_code}" if editor_code else None
+        data["invite_viewer_url"] = f"{base}/c/{viewer_code}" if viewer_code else None
+    else:
+        data["share_token"] = None
+        data["short_code"] = None
+        data["short_url"] = None
+        data["share_path"] = None
+        data["invite_editor_url"] = None
+        data["invite_viewer_url"] = None
     return data
+
+
+def _fresh_invite_code() -> str:
+    for _ in range(12):
+        code = new_short_code()
+        if not db.invite_code_taken(code) and not db.short_code_taken(code):
+            return code
+    raise HTTPException(500, "Não foi possível gerar um convite.")
 
 
 def _fresh_short_code(list_id: str) -> str:
@@ -151,12 +189,27 @@ def _fresh_short_code(list_id: str) -> str:
     raise HTTPException(500, "Não foi possível gerar um código curto.")
 
 
-def _present_item(item: dict, *, owner: bool, mine: bool) -> dict:
-    data = {key: value for key, value in item.items() if key != "reserved_token_hash"}
+def _present_item(item: dict, *, owner: bool, mine: bool, added_by_label: str | None = None) -> dict:
+    hidden = {"reserved_token_hash", "added_by", "reserved_by"}
+    data = {key: value for key, value in item.items() if key not in hidden}
     if not owner and not mine:
         data["reserved_label"] = None
     data["reserved_by_me"] = mine
+    data["added_by_label"] = added_by_label
     return data
+
+
+def _present_items(items: list[dict], *, member: bool, user_id: str | None, claims: dict[str, str] | None = None) -> list[dict]:
+    labels = db.labels_for_users([item.get("added_by") for item in items if item.get("added_by")])
+    presented = []
+    for item in items:
+        mine = bool(user_id and item.get("reserved_by") == user_id)
+        if not mine and claims is not None:
+            mine = _claim_matches(item, claims.get(item["id"]))
+        presented.append(
+            _present_item(item, owner=member, mine=mine, added_by_label=labels.get(item.get("added_by")))
+        )
+    return presented
 
 
 def _claim_matches(item: dict, token: str | None) -> bool:
@@ -186,17 +239,38 @@ def _auth_payload(user: dict) -> dict:
     return {"token": issue_token(user["id"], user["email"]), "user": user}
 
 
-def _require_list(list_id: str, user: dict) -> dict:
-    found = db.get_owned_list(list_id, user["id"])
+_ROLE_RANK = {"viewer": 1, "editor": 2, "owner": 3}
+
+
+def _clean_invite_role(value: str) -> str:
+    role = (value or "").strip().lower()
+    if role not in {"editor", "viewer"}:
+        raise HTTPException(400, "Escolha Pode editar ou Só pode ver.")
+    return role
+
+
+def _access(list_id: str, user: dict, minimum: str = "viewer") -> dict:
+    found = db.get_list_for_member(list_id, user["id"])
     if found is None:
         raise HTTPException(404, "Lista não encontrada.")
+    if _ROLE_RANK[found["role"]] < _ROLE_RANK[minimum]:
+        raise HTTPException(403, "Você só pode ver esta lista.")
     return found
 
 
-def _require_category(category_id: str, user: dict) -> dict:
+def _access_item(item_id: str, user: dict, minimum: str = "editor") -> dict:
+    item = db.get_item(item_id)
+    if item is None:
+        raise HTTPException(404, "Item não encontrado.")
+    _access(item["list_id"], user, minimum)
+    return item
+
+
+def _require_category(category_id: str, user: dict, minimum: str = "editor") -> dict:
     category = db.get_category(category_id)
-    if category is None or db.get_owned_list(category["list_id"], user["id"]) is None:
+    if category is None:
         raise HTTPException(404, "Categoria não encontrada.")
+    _access(category["list_id"], user, minimum)
     return category
 
 
@@ -210,10 +284,7 @@ def _category_on_list(list_id: str, category_id: str | None) -> str | None:
 
 
 def _require_item(item_id: str, user: dict) -> dict:
-    item = db.user_owns_item(user["id"], item_id)
-    if item is None:
-        raise HTTPException(404, "Item não encontrado.")
-    return item
+    return _access_item(item_id, user, "editor")
 
 
 def _clean_name(name: str) -> str:
@@ -322,7 +393,7 @@ def apple_app_site_association():
         {
             "applinks": {
                 "apps": [],
-                "details": [{"appID": app_id, "paths": ["/s/*"]}],
+                "details": [{"appID": app_id, "paths": ["/s/*", "/c/*"]}],
             }
         }
     )
@@ -365,6 +436,46 @@ def short_link(code: str, request: Request):
     return Response(page, media_type="text/html; charset=utf-8")
 
 
+@app.get("/c/{code}")
+def invite_link(code: str, request: Request):
+    found = db.get_invite(code)
+    if found is None:
+        page = "<!doctype html><html lang='pt-BR'><head><meta charset='utf-8'><title>Convite indisponível</title></head><body><p>Esse convite não está mais disponível.</p></body></html>"
+        return Response(page, status_code=404, media_type="text/html; charset=utf-8")
+    role = found["invite_role"]
+    role_label = "pode editar" if role == "editor" else "só pode ver"
+    target = f"{_web_base()}/#/c/{code}"
+    owner = _owner_label((db.get_user(found["user_id"]) or {}).get("email"))
+    title = found["name"]
+    description = f"{owner} convidou você para esta lista. Você {role_label}."
+    image = ""
+    for item in found.get("items") or []:
+        if item.get("image_url"):
+            public_id = found.get("short_code") or found.get("share_token")
+            if public_id:
+                image = f"{_short_base(request)}/api/share/{public_id}/items/{item['id']}/image"
+            break
+    image_tag = f'<meta property="og:image" content="{html.escape(image, quote=True)}">' if image else ""
+    page = f"""<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<title>{html.escape(title)} — Quero</title>
+<meta property="og:type" content="website">
+<meta property="og:title" content="{html.escape(title, quote=True)}">
+<meta property="og:description" content="{html.escape(description, quote=True)}">
+<meta property="og:url" content="{html.escape(_short_base(request) + '/c/' + code, quote=True)}">
+{image_tag}
+<meta http-equiv="refresh" content="0;url={html.escape(target, quote=True)}">
+<script>location.replace({json.dumps(target)});</script>
+</head>
+<body>
+<p>Abrindo o convite… <a href="{html.escape(target, quote=True)}">Continuar</a></p>
+</body>
+</html>"""
+    return Response(page, media_type="text/html; charset=utf-8")
+
+
 @app.post("/api/auth/register", status_code=201)
 def register(body: AuthBody):
     email = _clean_email(body.email)
@@ -400,6 +511,7 @@ def post_list(body: ListBody, request: Request, user: dict = Depends(current_use
 
 @app.patch("/api/lists/{list_id}")
 def patch_list(list_id: str, body: ListBody, request: Request, user: dict = Depends(current_user)):
+    _access(list_id, user, "owner")
     updated = db.rename_list(list_id, user["id"], _clean_name(body.name))
     if updated is None:
         raise HTTPException(404, "Lista não encontrada.")
@@ -408,6 +520,7 @@ def patch_list(list_id: str, body: ListBody, request: Request, user: dict = Depe
 
 @app.delete("/api/lists/{list_id}", status_code=204)
 def remove_list(list_id: str, user: dict = Depends(current_user)):
+    _access(list_id, user, "owner")
     if not db.delete_list(list_id, user["id"]):
         raise HTTPException(404, "Lista não encontrada.")
     return Response(status_code=204)
@@ -429,7 +542,7 @@ def _save_share(list_id: str, user_id: str, token: str | None, code: str | None)
 
 @app.post("/api/lists/{list_id}/share")
 def create_share(list_id: str, request: Request, user: dict = Depends(current_user)):
-    current = _require_list(list_id, user)
+    current = _access(list_id, user, "owner")
     token = current["share_token"] or _new_share_token()
     code = current["short_code"] or _fresh_short_code(list_id)
     if token == current["share_token"] and code == current["short_code"]:
@@ -440,22 +553,129 @@ def create_share(list_id: str, request: Request, user: dict = Depends(current_us
 
 @app.post("/api/lists/{list_id}/share/regenerate")
 def regenerate_share(list_id: str, request: Request, user: dict = Depends(current_user)):
-    _require_list(list_id, user)
+    _access(list_id, user, "owner")
     updated = _save_share(list_id, user["id"], _new_share_token(), _fresh_short_code(list_id))
     return _present_list(updated, request)
 
 
 @app.delete("/api/lists/{list_id}/share", status_code=200)
 def revoke_share(list_id: str, request: Request, user: dict = Depends(current_user)):
-    _require_list(list_id, user)
+    _access(list_id, user, "owner")
     updated = _save_share(list_id, user["id"], None, None)
     return _present_list(updated, request)
 
 
+def _save_invite(list_id: str, user_id: str, role: str, code: str | None, request: Request):
+    try:
+        saved = db.set_invite_code(list_id, role, code)
+    except ValueError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    if not saved:
+        raise HTTPException(404, "Lista não encontrada.")
+    found = db.get_list_for_member(list_id, user_id)
+    if found is None:
+        raise HTTPException(404, "Lista não encontrada.")
+    return _present_list(found, request)
+
+
+@app.post("/api/lists/{list_id}/invites/{role}")
+def create_invite(list_id: str, role: str, request: Request, user: dict = Depends(current_user)):
+    _access(list_id, user, "owner")
+    role = _clean_invite_role(role)
+    current = db.get_list_for_member(list_id, user["id"])
+    assert current is not None
+    existing = current["invite_editor_code"] if role == "editor" else current["invite_viewer_code"]
+    if existing:
+        return _present_list(current, request)
+    return _save_invite(list_id, user["id"], role, _fresh_invite_code(), request)
+
+
+@app.post("/api/lists/{list_id}/invites/{role}/regenerate")
+def regenerate_invite(list_id: str, role: str, request: Request, user: dict = Depends(current_user)):
+    _access(list_id, user, "owner")
+    return _save_invite(list_id, user["id"], _clean_invite_role(role), _fresh_invite_code(), request)
+
+
+@app.delete("/api/lists/{list_id}/invites/{role}")
+def disable_invite(list_id: str, role: str, request: Request, user: dict = Depends(current_user)):
+    _access(list_id, user, "owner")
+    return _save_invite(list_id, user["id"], _clean_invite_role(role), None, request)
+
+
+@app.get("/api/invites/{code}")
+def preview_invite(code: str, user: dict = Depends(current_user)):
+    found = db.get_invite(code)
+    if found is None:
+        raise HTTPException(404, "Esse convite não está mais disponível.")
+    return {"list_id": found["id"], "name": found["name"], "role": found["invite_role"]}
+
+
+@app.post("/api/invites/{code}/accept")
+def accept_invite(code: str, request: Request, user: dict = Depends(current_user)):
+    found = db.get_invite(code)
+    if found is None:
+        raise HTTPException(404, "Esse convite não está mais disponível.")
+    if found["user_id"] != user["id"]:
+        db.add_member(found["id"], user["id"], found["invite_role"])
+    updated = db.get_list_for_member(found["id"], user["id"])
+    if updated is None:
+        raise HTTPException(404, "Lista não encontrada.")
+    return _present_list(updated, request)
+
+
+@app.get("/api/lists/{list_id}/members")
+def get_members(list_id: str, user: dict = Depends(current_user)):
+    _access(list_id, user, "viewer")
+    return {"members": db.list_members(list_id)}
+
+
+@app.post("/api/lists/{list_id}/members")
+def invite_member(list_id: str, body: MemberBody, user: dict = Depends(current_user)):
+    _access(list_id, user, "owner")
+    role = _clean_invite_role(body.role)
+    email = _clean_email(body.email)
+    account = db.get_user_by_email(email)
+    if account is None:
+        raise HTTPException(404, "Não há conta com esse e-mail. Envie o link de convite.")
+    if account["id"] == user["id"]:
+        raise HTTPException(400, "Você já é o dono desta lista.")
+    db.add_member(list_id, account["id"], role)
+    return {"members": db.list_members(list_id)}
+
+
+@app.patch("/api/lists/{list_id}/members/{member_id}")
+def change_member_role(list_id: str, member_id: str, body: RoleBody, user: dict = Depends(current_user)):
+    _access(list_id, user, "owner")
+    role = _clean_invite_role(body.role)
+    if not db.set_member_role(list_id, member_id, role):
+        raise HTTPException(404, "Esse membro não pode mudar de papel.")
+    return {"members": db.list_members(list_id)}
+
+
+@app.delete("/api/lists/{list_id}/members/{member_id}")
+def remove_member(list_id: str, member_id: str, user: dict = Depends(current_user)):
+    _access(list_id, user, "owner")
+    if member_id == user["id"]:
+        raise HTTPException(400, "O dono não sai da lista por aqui. Exclua a lista se quiser encerrá-la.")
+    if not db.remove_member(list_id, member_id):
+        raise HTTPException(404, "Membro não encontrado.")
+    return {"members": db.list_members(list_id)}
+
+
+@app.post("/api/lists/{list_id}/leave", status_code=204)
+def leave_list(list_id: str, user: dict = Depends(current_user)):
+    found = _access(list_id, user, "viewer")
+    if found["role"] == "owner":
+        raise HTTPException(400, "O dono não pode sair da lista. Exclua a lista se quiser encerrá-la.")
+    if not db.remove_member(list_id, user["id"]):
+        raise HTTPException(404, "Lista não encontrada.")
+    return Response(status_code=204)
+
+
 @app.get("/api/lists/{list_id}/items")
 def get_items(list_id: str, request: Request, user: dict = Depends(current_user)):
-    found = _require_list(list_id, user)
-    items = [_present_item(item, owner=True, mine=False) for item in db.list_items(list_id)]
+    found = _access(list_id, user, "viewer")
+    items = _present_items(db.list_items(list_id), member=True, user_id=user["id"])
     totals, unpriced = _totals(items)
     return {
         "list": _present_list(found, request),
@@ -468,7 +688,7 @@ def get_items(list_id: str, request: Request, user: dict = Depends(current_user)
 
 @app.post("/api/lists/{list_id}/categories", status_code=201)
 def post_category(list_id: str, body: CategoryBody, user: dict = Depends(current_user)):
-    _require_list(list_id, user)
+    _access(list_id, user, "editor")
     return db.create_category(list_id, _clean_name(body.name))
 
 
@@ -491,7 +711,7 @@ def remove_category(category_id: str, user: dict = Depends(current_user)):
 
 @app.post("/api/lists/{list_id}/categories/reorder")
 def reorder_categories(list_id: str, body: CategoryOrder, user: dict = Depends(current_user)):
-    _require_list(list_id, user)
+    _access(list_id, user, "editor")
     try:
         return {"categories": db.reorder_categories(list_id, body.ids)}
     except ValueError as exc:
@@ -500,7 +720,7 @@ def reorder_categories(list_id: str, body: CategoryOrder, user: dict = Depends(c
 
 @app.post("/api/lists/{list_id}/items", status_code=201)
 def create_item(list_id: str, body: ItemCreate, user: dict = Depends(current_user)):
-    _require_list(list_id, user)
+    _access(list_id, user, "editor")
     name = _clean_name(body.name)
     url = (body.url or "").strip()
     if len(url) > 2000:
@@ -513,10 +733,11 @@ def create_item(list_id: str, body: ItemCreate, user: dict = Depends(current_use
             "name": name,
             "url": url,
             "category_id": _category_on_list(list_id, body.category_id),
+            "added_by": user["id"],
             **_fields_from_extraction(extracted, url),
         },
     )
-    return _present_item(item, owner=True, mine=False)
+    return _present_items([item], member=True, user_id=user["id"])[0]
 
 
 @app.patch("/api/items/{item_id}")
@@ -551,7 +772,7 @@ def patch_item(item_id: str, body: ItemUpdate, user: dict = Depends(current_user
     if "category_id" in sent:
         changes["category_id"] = _category_on_list(current["list_id"], body.category_id)
     if not changes:
-        return _present_item(current, owner=True, mine=False)
+        return _present_items([current], member=True, user_id=user["id"])[0]
     content_changed = any(key in changes for key in ("image_url", "price", "currency"))
     image = changes["image_url"] if "image_url" in changes else current["image_url"]
     price = changes["price"] if "price" in changes else current["price"]
@@ -570,7 +791,7 @@ def patch_item(item_id: str, body: ItemUpdate, user: dict = Depends(current_user
     updated = db.update_item(item_id, changes)
     if updated is None:
         raise HTTPException(404, "Item não encontrado.")
-    return _present_item(updated, owner=True, mine=False)
+    return _present_items([updated], member=True, user_id=user["id"])[0]
 
 
 @app.post("/api/items/{item_id}/refresh")
@@ -604,19 +825,48 @@ def refresh_item(item_id: str, user: dict = Depends(current_user)):
     updated = db.update_item(item_id, changes)
     if updated is None:
         raise HTTPException(404, "Item não encontrado.")
-    return _present_item(updated, owner=True, mine=False)
+    return _present_items([updated], member=True, user_id=user["id"])[0]
+
+
+@app.post("/api/items/{item_id}/reservation")
+def member_reserve(item_id: str, body: ReserveBody, user: dict = Depends(current_user)):
+    item = _access_item(item_id, user, "viewer")
+    if item["reserved"]:
+        raise HTTPException(409, "Alguém já marcou este item.")
+    from datetime import datetime, timezone
+
+    label = " ".join((body.name or "").split())[:80] or db.person_label(user["email"])
+    updated = db.update_item(
+        item_id,
+        {
+            "reserved_label": label,
+            "reserved_by": user["id"],
+            "reserved_token_hash": None,
+            "reserved_at": datetime.now(timezone.utc).isoformat(),
+        },
+    )
+    if updated is None:
+        raise HTTPException(404, "Item não encontrado.")
+    return _present_items([updated], member=True, user_id=user["id"])[0]
 
 
 @app.delete("/api/items/{item_id}/reservation", status_code=204)
 def owner_clear_reservation(item_id: str, user: dict = Depends(current_user)):
-    item = _require_item(item_id, user)
-    db.update_item(item["id"], {"reserved_label": None, "reserved_token_hash": None, "reserved_at": None})
+    item = _access_item(item_id, user, "viewer")
+    membership = db.get_list_for_member(item["list_id"], user["id"])
+    if membership and membership["role"] == "viewer" and item.get("reserved_by") != user["id"]:
+        raise HTTPException(403, "Só quem reservou pode desmarcar.")
+    db.update_item(
+        item["id"],
+        {"reserved_label": None, "reserved_token_hash": None, "reserved_at": None, "reserved_by": None},
+    )
     return Response(status_code=204)
 
 
 @app.delete("/api/items/{item_id}", status_code=204)
 def remove_item(item_id: str, user: dict = Depends(current_user)):
-    if db.user_owns_item(user["id"], item_id) is None or not db.delete_item(item_id):
+    _access_item(item_id, user, "editor")
+    if not db.delete_item(item_id):
         raise HTTPException(404, "Item não encontrado.")
     return Response(status_code=204)
 
@@ -627,10 +877,7 @@ def share_view(token: str, x_claims: str | None = Header(default=None)):
     if found is None:
         raise HTTPException(404, "Esse link não está mais disponível.")
     claims = _claims(x_claims)
-    items = []
-    for item in found.pop("items"):
-        mine = _claim_matches(item, claims.get(item["id"]))
-        items.append(_present_item(item, owner=False, mine=mine))
+    items = _present_items(found.pop("items"), member=False, user_id=None, claims=claims)
     totals, unpriced = _totals(items)
     return {
         "list": {"name": found["name"], "share_path": found.get("share_path") or f"/l/{token}"},
@@ -683,7 +930,7 @@ def clear_reservation(token: str, item_id: str, x_claim_token: str | None = Head
 
 @app.get("/api/items/{item_id}/image")
 def item_image(item_id: str, user: dict = Depends(current_user)):
-    item = _require_item(item_id, user)
+    item = _access_item(item_id, user, "viewer")
     return _image_response(item)
 
 

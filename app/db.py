@@ -191,9 +191,71 @@ def row_to_item(row) -> dict:
         "reserved_label": row["reserved_label"],
         "reserved_token_hash": row["reserved_token_hash"],
         "reserved_at": row["reserved_at"],
+        "reserved_by": row["reserved_by"] if "reserved_by" in row.keys() else None,
+        "added_by": row["added_by"] if "added_by" in row.keys() else None,
         "created_at": row["created_at"],
         "updated_at": row["updated_at"],
     }
+
+
+def person_label(email: str | None) -> str:
+    if not email or "@" not in email:
+        return "alguém"
+    name = email.split("@", 1)[0].replace(".", " ").replace("_", " ").strip()
+    return name[:1].upper() + name[1:] if name else "alguém"
+
+
+def person_initials(email: str | None) -> str:
+    if not email or "@" not in email:
+        return "?"
+    local = email.split("@", 1)[0]
+    parts = [part for part in local.replace(".", " ").replace("_", " ").replace("-", " ").split() if part]
+    if len(parts) >= 2:
+        return (parts[0][0] + parts[1][0]).upper()
+    cleaned = "".join(char for char in local if char.isalnum())
+    return (cleaned[:2] or "?").upper()
+
+
+def _member_from_row(row) -> dict:
+    email = row["email"]
+    return {
+        "user_id": row["user_id"],
+        "email": email,
+        "label": person_label(email),
+        "initials": person_initials(email),
+        "role": row["role"],
+    }
+
+
+def _member_rows(conn: _Conn, list_id: str) -> list[dict]:
+    rows = conn.execute(
+        """
+        SELECT list_members.user_id, list_members.role, users.email
+        FROM list_members
+        JOIN users ON users.id = list_members.user_id
+        WHERE list_members.list_id = ?
+        ORDER BY CASE list_members.role WHEN 'owner' THEN 0 WHEN 'editor' THEN 1 ELSE 2 END, users.email
+        """,
+        (list_id,),
+    ).fetchall()
+    return [_member_from_row(row) for row in rows]
+
+
+def _decorate_list(conn: _Conn, row, items: list[dict], role: str) -> dict:
+    payload = row_to_list(row, items)
+    payload["role"] = role
+    payload["members"] = _member_rows(conn, row["id"])
+    keys = row.keys()
+    payload["invite_editor_code"] = row["invite_editor_code"] if "invite_editor_code" in keys else None
+    payload["invite_viewer_code"] = row["invite_viewer_code"] if "invite_viewer_code" in keys else None
+    return payload
+
+
+def _insert_owner(conn: _Conn, list_id: str, user_id: str, now: str) -> None:
+    conn.execute(
+        "INSERT INTO list_members (id, list_id, user_id, role, created_at) VALUES (?, ?, ?, 'owner', ?)",
+        (str(uuid4()), list_id, user_id, now),
+    )
 
 
 def public_item(item: dict, *, mine: bool) -> dict:
@@ -234,6 +296,7 @@ def register_user(email: str, password_hash: str) -> dict:
             "INSERT INTO lists (id, user_id, name, share_token, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
             (list_id, user_id, "Minha lista", None, now, now),
         )
+        _insert_owner(conn, list_id, user_id, now)
         count = _count(conn.execute("SELECT COUNT(*) AS n FROM users").fetchone())
         if count == 1:
             _adopt_legacy(conn, list_id, now)
@@ -296,7 +359,13 @@ def _adopt_legacy(conn: _Conn, list_id: str, now: str) -> None:
 def lists_for_user(user_id: str) -> list[dict]:
     with _lock, connect() as conn:
         rows = conn.execute(
-            "SELECT * FROM lists WHERE user_id = ? ORDER BY updated_at DESC",
+            """
+            SELECT lists.*, list_members.role AS member_role
+            FROM list_members
+            JOIN lists ON lists.id = list_members.list_id
+            WHERE list_members.user_id = ?
+            ORDER BY lists.updated_at DESC
+            """,
             (user_id,),
         ).fetchall()
         result = []
@@ -308,20 +377,35 @@ def lists_for_user(user_id: str) -> list[dict]:
                     (row["id"],),
                 ).fetchall()
             ]
-            result.append(row_to_list(row, items))
+            result.append(_decorate_list(conn, row, items, row["member_role"]))
     return result
 
 
-def get_owned_list(list_id: str, user_id: str) -> dict | None:
+def get_list_for_member(list_id: str, user_id: str) -> dict | None:
     with _lock, connect() as conn:
-        row = conn.execute("SELECT * FROM lists WHERE id = ? AND user_id = ?", (list_id, user_id)).fetchone()
+        row = conn.execute(
+            """
+            SELECT lists.*, list_members.role AS member_role
+            FROM lists
+            JOIN list_members ON list_members.list_id = lists.id AND list_members.user_id = ?
+            WHERE lists.id = ?
+            """,
+            (user_id, list_id),
+        ).fetchone()
         if row is None:
             return None
         items = [
             row_to_item(item)
             for item in conn.execute("SELECT * FROM items WHERE list_id = ?", (list_id,)).fetchall()
         ]
-    return row_to_list(row, items)
+        return _decorate_list(conn, row, items, row["member_role"])
+
+
+def get_owned_list(list_id: str, user_id: str) -> dict | None:
+    found = get_list_for_member(list_id, user_id)
+    if found is None or found.get("role") != "owner":
+        return None
+    return found
 
 
 def create_list(user_id: str, name: str) -> dict:
@@ -332,6 +416,7 @@ def create_list(user_id: str, name: str) -> dict:
             "INSERT INTO lists (id, user_id, name, share_token, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
             (list_id, user_id, name, None, now, now),
         )
+        _insert_owner(conn, list_id, user_id, now)
     found = get_owned_list(list_id, user_id)
     assert found is not None
     return found
@@ -442,9 +527,9 @@ def insert_item(list_id: str, fields: dict) -> dict:
             """
             INSERT INTO items (
               id, list_id, category_id, name, url, image_url, price, currency, store, status, message,
-              image_source, price_source, reserved_label, reserved_token_hash, reserved_at,
-              created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+              image_source, price_source, reserved_label, reserved_token_hash, reserved_at, reserved_by,
+              added_by, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 item_id,
@@ -463,6 +548,8 @@ def insert_item(list_id: str, fields: dict) -> dict:
                 None,
                 None,
                 None,
+                None,
+                fields.get("added_by"),
                 now,
                 now,
             ),
@@ -492,6 +579,7 @@ def update_item(item_id: str, fields: dict) -> dict | None:
         "reserved_label",
         "reserved_token_hash",
         "reserved_at",
+        "reserved_by",
     }
     changes = {key: value for key, value in fields.items() if key in allowed}
     if not changes:
@@ -578,6 +666,117 @@ def reorder_categories(list_id: str, ids: list[str]) -> list[dict]:
                 (position, now, category_id, list_id),
             )
     return list_categories(list_id)
+
+
+def labels_for_users(user_ids: list[str]) -> dict[str, str]:
+    unique = [user_id for user_id in dict.fromkeys(user_ids) if user_id]
+    if not unique:
+        return {}
+    marks = ", ".join("?" for _ in unique)
+    with _lock, connect() as conn:
+        rows = conn.execute(f"SELECT id, email FROM users WHERE id IN ({marks})", tuple(unique)).fetchall()
+    return {row["id"]: person_label(row["email"]) for row in rows}
+
+
+def list_members(list_id: str) -> list[dict]:
+    with _lock, connect() as conn:
+        return _member_rows(conn, list_id)
+
+
+def add_member(list_id: str, user_id: str, role: str) -> None:
+    if role not in {"editor", "viewer"}:
+        raise ValueError("Escolha Pode editar ou Só pode ver.")
+    now = utc_now()
+    with _lock, connect() as conn:
+        existing = conn.execute(
+            "SELECT id, role FROM list_members WHERE list_id = ? AND user_id = ?",
+            (list_id, user_id),
+        ).fetchone()
+        if existing is not None:
+            if existing["role"] == "owner":
+                return
+            conn.execute("UPDATE list_members SET role = ? WHERE id = ?", (role, existing["id"]))
+            return
+        conn.execute(
+            "INSERT INTO list_members (id, list_id, user_id, role, created_at) VALUES (?, ?, ?, ?, ?)",
+            (str(uuid4()), list_id, user_id, role, now),
+        )
+
+
+def set_member_role(list_id: str, user_id: str, role: str) -> bool:
+    if role not in {"editor", "viewer"}:
+        raise ValueError("Escolha Pode editar ou Só pode ver.")
+    with _lock, connect() as conn:
+        cursor = conn.execute(
+            "UPDATE list_members SET role = ? WHERE list_id = ? AND user_id = ? AND role != 'owner'",
+            (role, list_id, user_id),
+        )
+        return cursor.rowcount > 0
+
+
+def remove_member(list_id: str, user_id: str) -> bool:
+    with _lock, connect() as conn:
+        cursor = conn.execute(
+            "DELETE FROM list_members WHERE list_id = ? AND user_id = ? AND role != 'owner'",
+            (list_id, user_id),
+        )
+        return cursor.rowcount > 0
+
+
+def invite_code_taken(code: str) -> bool:
+    with _lock, connect() as conn:
+        row = conn.execute(
+            "SELECT 1 FROM lists WHERE invite_editor_code = ? OR invite_viewer_code = ?",
+            (code, code),
+        ).fetchone()
+    return row is not None
+
+
+def set_invite_code(list_id: str, role: str, code: str | None) -> bool:
+    if role == "editor":
+        column = "invite_editor_code"
+        other = "invite_viewer_code"
+    elif role == "viewer":
+        column = "invite_viewer_code"
+        other = "invite_editor_code"
+    else:
+        raise ValueError("Escolha Pode editar ou Só pode ver.")
+    now = utc_now()
+    with _lock, connect() as conn:
+        if code:
+            clash = conn.execute(
+                f"SELECT id FROM lists WHERE ({column} = ? OR {other} = ?) AND NOT (id = ? AND {column} = ?)",
+                (code, code, list_id, code),
+            ).fetchone()
+            if clash:
+                raise ValueError("Esse código já está em uso.")
+        cursor = conn.execute(
+            f"UPDATE lists SET {column} = ?, updated_at = ? WHERE id = ?",
+            (code, now, list_id),
+        )
+        return cursor.rowcount > 0
+
+
+def get_invite(code: str) -> dict | None:
+    with _lock, connect() as conn:
+        row = conn.execute(
+            "SELECT * FROM lists WHERE invite_editor_code = ? OR invite_viewer_code = ?",
+            (code, code),
+        ).fetchone()
+        if row is None:
+            return None
+        role = "editor" if row["invite_editor_code"] == code else "viewer"
+        items = [
+            row_to_item(item)
+            for item in conn.execute(
+                "SELECT * FROM items WHERE list_id = ? ORDER BY created_at DESC",
+                (row["id"],),
+            ).fetchall()
+        ]
+        payload = row_to_list(row, items)
+        payload["items"] = items
+        payload["invite_role"] = role
+        return payload
 
 
 def delete_item(item_id: str) -> bool:
