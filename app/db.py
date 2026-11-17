@@ -1,7 +1,7 @@
 """Persistence for wishlist items.
 
 `DATABASE_URL` (Postgres, including Render, Neon, or Supabase) is used when
-set. Otherwise the list is a SQLite file at `QUERO_DB` or `data/wishlist.db`.
+set. Otherwise the list is a SQLite file at `WISHLY_DB`, or `QUERO_DB` if that is unset, or `data/wishlist.db`.
 Render's free web disk is ephemeral, so a hosted Postgres URL is what keeps
 the list after a restart.
 """
@@ -70,7 +70,7 @@ def migrate() -> None:
 
 
 def db_path() -> Path:
-    configured = os.environ.get("QUERO_DB")
+    configured = (os.environ.get("WISHLY_DB") or os.environ.get("QUERO_DB") or "").strip()
     if configured:
         return Path(configured)
     return Path(__file__).resolve().parents[1] / "data" / "wishlist.db"
@@ -148,25 +148,33 @@ def row_to_user(row) -> dict:
     return {"id": row["id"], "email": row["email"], "created_at": row["created_at"]}
 
 
-def row_to_list(row, items: list[dict] | None = None) -> dict:
-    priced = [item for item in (items or []) if item["price"] is not None]
+def _bucket_totals(items: list[dict]) -> list[dict]:
     buckets: dict[str, float] = {}
-    for item in priced:
+    for item in items:
+        if item["price"] is None:
+            continue
         code = item["currency"] or ""
         buckets[code] = buckets.get(code, 0.0) + float(item["price"])
-    totals = [
+    return [
         {"currency": key or None, "amount": round(value, 2)}
         for key, value in sorted(buckets.items(), key=lambda pair: (pair[0] != "BRL", pair[0] == "", pair[0]))
     ]
+
+
+def row_to_list(row, items: list[dict] | None = None) -> dict:
+    rows = items or []
+    remaining = [item for item in rows if not item.get("purchased")]
+    bought = [item for item in rows if item.get("purchased")]
     return {
         "id": row["id"],
         "name": row["name"],
         "user_id": row["user_id"],
         "share_token": row["share_token"],
         "short_code": row["short_code"],
-        "item_count": len(items or []),
-        "unpriced_count": sum(1 for item in (items or []) if item["price"] is None),
-        "totals": totals,
+        "item_count": len(rows),
+        "unpriced_count": sum(1 for item in remaining if item["price"] is None),
+        "totals": _bucket_totals(remaining),
+        "purchased_totals": _bucket_totals(bought),
         "created_at": row["created_at"],
         "updated_at": row["updated_at"],
     }
@@ -193,6 +201,9 @@ def row_to_item(row) -> dict:
         "reserved_at": row["reserved_at"],
         "reserved_by": row["reserved_by"] if "reserved_by" in row.keys() else None,
         "added_by": row["added_by"] if "added_by" in row.keys() else None,
+        "purchased": bool(row["purchased"]) if "purchased" in row.keys() else False,
+        "purchased_at": row["purchased_at"] if "purchased_at" in row.keys() else None,
+        "purchased_by": row["purchased_by"] if "purchased_by" in row.keys() else None,
         "created_at": row["created_at"],
         "updated_at": row["updated_at"],
     }
@@ -580,6 +591,9 @@ def update_item(item_id: str, fields: dict) -> dict | None:
         "reserved_token_hash",
         "reserved_at",
         "reserved_by",
+        "purchased",
+        "purchased_at",
+        "purchased_by",
     }
     changes = {key: value for key, value in fields.items() if key in allowed}
     if not changes:

@@ -1,4 +1,4 @@
-"""HTTP API for the Quero wishlist."""
+"""HTTP API for the Wishly wishlist."""
 
 from __future__ import annotations
 
@@ -72,6 +72,7 @@ class ItemUpdate(BaseModel):
     price: float | None = None
     currency: str | None = None
     category_id: str | None = None
+    purchased: bool | None = None
 
 
 class MemberBody(BaseModel):
@@ -92,18 +93,11 @@ def _web_dir() -> Path:
     return Path(__file__).resolve().parents[2] / "frontend" / "build" / "web"
 
 
-def _totals(items: list[dict]) -> tuple[list[dict], int]:
-    buckets: dict[str, float] = {}
-    unpriced = 0
-    for item in items:
-        if item["price"] is None:
-            unpriced += 1
-            continue
-        currency = item["currency"] or ""
-        buckets[currency] = buckets.get(currency, 0.0) + float(item["price"])
-    ordered = sorted(buckets.items(), key=lambda pair: (pair[0] != "BRL", pair[0] == "", pair[0]))
-    totals = [{"currency": key or None, "amount": round(value, 2)} for key, value in ordered]
-    return totals, unpriced
+def _split_totals(items: list[dict]) -> tuple[list[dict], list[dict], int]:
+    remaining = [item for item in items if not item.get("purchased")]
+    bought = [item for item in items if item.get("purchased")]
+    unpriced = sum(1 for item in remaining if item["price"] is None)
+    return db._bucket_totals(remaining), db._bucket_totals(bought), unpriced
 
 
 _EMAIL = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
@@ -189,25 +183,41 @@ def _fresh_short_code(list_id: str) -> str:
     raise HTTPException(500, "Não foi possível gerar um código curto.")
 
 
-def _present_item(item: dict, *, owner: bool, mine: bool, added_by_label: str | None = None) -> dict:
-    hidden = {"reserved_token_hash", "added_by", "reserved_by"}
+def _present_item(
+    item: dict,
+    *,
+    owner: bool,
+    mine: bool,
+    added_by_label: str | None = None,
+    purchased_by_label: str | None = None,
+) -> dict:
+    hidden = {"reserved_token_hash", "added_by", "reserved_by", "purchased_by"}
     data = {key: value for key, value in item.items() if key not in hidden}
     if not owner and not mine:
         data["reserved_label"] = None
     data["reserved_by_me"] = mine
     data["added_by_label"] = added_by_label
+    data["purchased_by_label"] = purchased_by_label
     return data
 
 
 def _present_items(items: list[dict], *, member: bool, user_id: str | None, claims: dict[str, str] | None = None) -> list[dict]:
-    labels = db.labels_for_users([item.get("added_by") for item in items if item.get("added_by")])
+    ids = [item.get("added_by") for item in items if item.get("added_by")]
+    ids.extend(item.get("purchased_by") for item in items if item.get("purchased_by"))
+    labels = db.labels_for_users(ids)
     presented = []
     for item in items:
         mine = bool(user_id and item.get("reserved_by") == user_id)
         if not mine and claims is not None:
             mine = _claim_matches(item, claims.get(item["id"]))
         presented.append(
-            _present_item(item, owner=member, mine=mine, added_by_label=labels.get(item.get("added_by")))
+            _present_item(
+                item,
+                owner=member,
+                mine=mine,
+                added_by_label=labels.get(item.get("added_by")),
+                purchased_by_label=labels.get(item.get("purchased_by")) if item.get("purchased") else None,
+            )
         )
     return presented
 
@@ -345,7 +355,7 @@ def _cors_origins() -> list[str]:
     return origins
 
 
-app = FastAPI(title="Quero", lifespan=lifespan)
+app = FastAPI(title="Wishly", lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=_cors_origins(),
@@ -367,7 +377,7 @@ def health():
 
 @app.get("/.well-known/assetlinks.json")
 def asset_links():
-    package = (os.environ.get("ANDROID_PACKAGE") or "com.quero.quero").strip()
+    package = (os.environ.get("ANDROID_PACKAGE") or "com.wishly.app").strip()
     raw = os.environ.get("ANDROID_SHA256_FINGERPRINTS") or ""
     fingerprints = [item.strip() for item in raw.split(",") if item.strip()]
     if not fingerprints:
@@ -388,7 +398,7 @@ def asset_links():
 
 @app.get("/.well-known/apple-app-site-association")
 def apple_app_site_association():
-    app_id = (os.environ.get("IOS_APP_ID") or "TEAMID.com.quero.quero").strip()
+    app_id = (os.environ.get("IOS_APP_ID") or "TEAMID.com.wishly.app").strip()
     return JSONResponse(
         {
             "applinks": {
@@ -409,7 +419,7 @@ def short_link(code: str, request: Request):
     target = f"{_web_base()}/#/l/{public_id}"
     owner = _owner_label((db.get_user(found["user_id"]) or {}).get("email"))
     title = found["name"]
-    description = f"Lista de {owner} no Quero"
+    description = f"Lista de {owner} no Wishly"
     image = ""
     for item in found.get("items") or []:
         if item.get("image_url"):
@@ -420,7 +430,8 @@ def short_link(code: str, request: Request):
 <html lang="pt-BR">
 <head>
 <meta charset="utf-8">
-<title>{html.escape(title)} — Quero</title>
+<title>{html.escape(title)} — Wishly</title>
+<meta property="og:site_name" content="Wishly">
 <meta property="og:type" content="website">
 <meta property="og:title" content="{html.escape(title, quote=True)}">
 <meta property="og:description" content="{html.escape(description, quote=True)}">
@@ -460,7 +471,8 @@ def invite_link(code: str, request: Request):
 <html lang="pt-BR">
 <head>
 <meta charset="utf-8">
-<title>{html.escape(title)} — Quero</title>
+<title>{html.escape(title)} — Wishly</title>
+<meta property="og:site_name" content="Wishly">
 <meta property="og:type" content="website">
 <meta property="og:title" content="{html.escape(title, quote=True)}">
 <meta property="og:description" content="{html.escape(description, quote=True)}">
@@ -676,12 +688,13 @@ def leave_list(list_id: str, user: dict = Depends(current_user)):
 def get_items(list_id: str, request: Request, user: dict = Depends(current_user)):
     found = _access(list_id, user, "viewer")
     items = _present_items(db.list_items(list_id), member=True, user_id=user["id"])
-    totals, unpriced = _totals(items)
+    totals, purchased_totals, unpriced = _split_totals(items)
     return {
         "list": _present_list(found, request),
         "categories": db.list_categories(list_id),
         "items": items,
         "totals": totals,
+        "purchased_totals": purchased_totals,
         "unpriced_count": unpriced,
     }
 
@@ -771,6 +784,17 @@ def patch_item(item_id: str, body: ItemUpdate, user: dict = Depends(current_user
         changes["currency"] = _clean_currency(body.currency)
     if "category_id" in sent:
         changes["category_id"] = _category_on_list(current["list_id"], body.category_id)
+    if "purchased" in sent:
+        from datetime import datetime, timezone
+
+        if body.purchased:
+            changes["purchased"] = 1
+            changes["purchased_at"] = datetime.now(timezone.utc).isoformat()
+            changes["purchased_by"] = user["id"]
+        else:
+            changes["purchased"] = 0
+            changes["purchased_at"] = None
+            changes["purchased_by"] = None
     if not changes:
         return _present_items([current], member=True, user_id=user["id"])[0]
     content_changed = any(key in changes for key in ("image_url", "price", "currency"))
@@ -878,12 +902,13 @@ def share_view(token: str, x_claims: str | None = Header(default=None)):
         raise HTTPException(404, "Esse link não está mais disponível.")
     claims = _claims(x_claims)
     items = _present_items(found.pop("items"), member=False, user_id=None, claims=claims)
-    totals, unpriced = _totals(items)
+    totals, purchased_totals, unpriced = _split_totals(items)
     return {
         "list": {"name": found["name"], "share_path": found.get("share_path") or f"/l/{token}"},
         "categories": db.list_categories(found["id"]),
         "items": items,
         "totals": totals,
+        "purchased_totals": purchased_totals,
         "unpriced_count": unpriced,
     }
 

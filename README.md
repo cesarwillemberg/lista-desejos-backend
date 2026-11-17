@@ -1,4 +1,4 @@
-# Quero — backend
+# Wishly — backend
 
 API da lista de desejos. Você cola o link de um produto; o servidor abre a página, lê a foto e o preço e guarda o item num SQLite. A interface fica no app Flutter.
 
@@ -23,15 +23,15 @@ export JWT_SECRET=dev-only-change-me-please
 | --- | --- | --- |
 | `HOST` | `0.0.0.0` | Bind address |
 | `PORT` | `47231` | Port |
-| `QUERO_DB` | `data/wishlist.db` | SQLite file |
+| `WISHLY_DB` | `data/wishlist.db` | SQLite file. `QUERO_DB` is still read if `WISHLY_DB` is unset |
 | `QUERO_WEB_DIR` | `../frontend/build/web` when that folder exists | Optional Flutter web build served on `/` |
 | `DATABASE_URL` | unset | Postgres URL (`postgres://` or `postgresql://`). When set, SQLite is not used |
 | `JWT_SECRET` | required | Signs login tokens. At least 16 characters. On Render, `render.yaml` generates it |
 | `PUBLIC_SHORT_BASE` | the request host | Origin of short links, no trailing slash. Production: `https://lista-desejos-backend.onrender.com` |
 | `PUBLIC_WEB_BASE` | the GitHub Pages URL | Where `/s/{code}` sends the browser. Default `https://cesarwillemberg.github.io/lista-desejos-frontend` |
-| `ANDROID_PACKAGE` | `com.quero.quero` | Package name inside `/.well-known/assetlinks.json` |
+| `ANDROID_PACKAGE` | `com.wishly.app` | Package name inside `/.well-known/assetlinks.json` |
 | `ANDROID_SHA256_FINGERPRINTS` | placeholder | Comma-separated signing cert fingerprints. Until you set this, the file contains `REPLACE_WITH_SHA256_FINGERPRINT` |
-| `IOS_APP_ID` | `TEAMID.com.quero.quero` | Apple team id plus bundle id for `apple-app-site-association`. Replace `TEAMID` |
+| `IOS_APP_ID` | `TEAMID.com.wishly.app` | Apple team id plus bundle id for `apple-app-site-association`. Replace `TEAMID` |
 | `CORS_ORIGINS` | `https://cesarwillemberg.github.io` | Comma-separated browser origins. Localhost is always allowed |
 
 ```bash
@@ -51,7 +51,7 @@ Accounts, lists, and items are created by Alembic (`alembic upgrade head` runs o
 - `POST /api/lists/{id}/invites/{role}`, `POST …/regenerate`, `DELETE …/{role}` manage two invite links. `GET /c/{code}` is the preview page. `POST /api/invites/{code}/accept` joins after login.
 - `POST /api/lists/{id}/share`, `POST …/share/regenerate`, `DELETE …/share`
 - `GET /api/share/{token}` — public read-only list. `POST/DELETE …/items/{id}/reservation` marks “Já comprei”
-- `GET/POST /api/lists/{id}/items`, plus `PATCH /api/items/{id}`, refresh, delete, and the image proxy
+- `GET/POST /api/lists/{id}/items`, plus `PATCH /api/items/{id}` (`purchased` marks it bought), refresh, delete, and the image proxy. `totals` is what is still to buy. `purchased_totals` is what is already bought. Viewers and the public link can see that flag and cannot change it.
 - `GET /api/health`
 
 Prices are numbers. `BRL` is formatted by the app as `R$ 1.299,90`. Other ISO currencies are left as returned by the page. The item is saved even when the store page cannot be read. A failed refresh keeps the previous photo and price.

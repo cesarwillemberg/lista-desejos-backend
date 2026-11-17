@@ -1,1 +1,1 @@
-"""Quero API: lista de desejos com leitura de foto e preço."""
+"""Wishly API: lista de desejos com leitura de foto e preço."""

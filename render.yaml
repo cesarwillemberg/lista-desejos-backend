@@ -34,10 +34,10 @@ services:
       - key: PUBLIC_SHORT_BASE
         value: https://lista-desejos-backend.onrender.com
       - key: ANDROID_PACKAGE
-        value: com.quero.quero
+        value: com.wishly.app
       - key: ANDROID_SHA256_FINGERPRINTS
         value: ""
       - key: IOS_APP_ID
-        value: TEAMID.com.quero.quero
+        value: TEAMID.com.wishly.app
       - key: PYTHONUNBUFFERED
         value: "1"

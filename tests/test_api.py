@@ -202,18 +202,18 @@ def test_categories_belong_to_a_list_and_delete_clears_items(client, monkeypatch
 
 
 def test_well_known_links(client, monkeypatch):
-    monkeypatch.setenv("ANDROID_PACKAGE", "com.quero.quero")
+    monkeypatch.setenv("ANDROID_PACKAGE", "com.wishly.app")
     monkeypatch.setenv("ANDROID_SHA256_FINGERPRINTS", "AA:BB, CC:DD")
-    monkeypatch.setenv("IOS_APP_ID", "TEAMID.com.quero.quero")
+    monkeypatch.setenv("IOS_APP_ID", "TEAMID.com.wishly.app")
     asset = client.get("/.well-known/assetlinks.json")
     assert asset.status_code == 200
     body = asset.json()
-    assert body[0]["target"]["package_name"] == "com.quero.quero"
+    assert body[0]["target"]["package_name"] == "com.wishly.app"
     assert body[0]["target"]["sha256_cert_fingerprints"] == ["AA:BB", "CC:DD"]
     apple = client.get("/.well-known/apple-app-site-association")
     assert apple.status_code == 200
     assert apple.json()["applinks"]["details"][0]["paths"] == ["/s/*", "/c/*"]
-    assert apple.json()["applinks"]["details"][0]["appID"] == "TEAMID.com.quero.quero"
+    assert apple.json()["applinks"]["details"][0]["appID"] == "TEAMID.com.wishly.app"
 
 
 def test_refresh_keeps_previous_when_fetch_fails(client, monkeypatch):
@@ -295,6 +295,55 @@ def test_first_user_adopts_legacy_items(tmp_path, monkeypatch):
         second_lists = client.get("/api/lists", headers=second).json()["lists"]
         second_items = client.get(f"/api/lists/{second_lists[0]['id']}/items", headers=second).json()["items"]
         assert second_items == []
+
+
+def test_purchased_splits_totals_and_viewers_cannot_toggle(client, monkeypatch):
+    monkeypatch.setattr("app.main.extract_product", lambda url: _ok(url))
+    ana, _ana = _auth(client, "dona@example.com")
+    editor, _editor = _auth(client, "edita@example.com")
+    viewer, _viewer = _auth(client, "olha@example.com")
+    list_id = client.get("/api/lists", headers=ana).json()["lists"][0]["id"]
+    assert client.post(
+        f"/api/lists/{list_id}/members",
+        json={"email": "edita@example.com", "role": "editor"},
+        headers=ana,
+    ).status_code == 200
+    assert client.post(
+        f"/api/lists/{list_id}/members",
+        json={"email": "olha@example.com", "role": "viewer"},
+        headers=ana,
+    ).status_code == 200
+    first = client.post(
+        f"/api/lists/{list_id}/items",
+        json={"name": "PS5", "url": "https://www.kabum.com.br/produto/1"},
+        headers=ana,
+    )
+    assert first.status_code == 201
+    assert first.json()["purchased"] is False
+    second = client.post(
+        f"/api/lists/{list_id}/items",
+        json={"name": "Echo", "url": "https://www.kabum.com.br/produto/2"},
+        headers=editor,
+    ).json()
+    marked = client.patch(f"/api/items/{first.json()['id']}", json={"purchased": True}, headers=editor)
+    assert marked.status_code == 200
+    assert marked.json()["purchased"] is True
+    assert marked.json()["purchased_at"]
+    assert marked.json()["purchased_by_label"] == "Edita"
+    assert client.patch(f"/api/items/{first.json()['id']}", json={"purchased": False}, headers=viewer).status_code == 403
+    listed = client.get(f"/api/lists/{list_id}/items", headers=viewer).json()
+    assert listed["items"][0]["purchased"] is True or any(item["purchased"] for item in listed["items"])
+    assert listed["totals"] == [{"currency": "BRL", "amount": 6196.39}]
+    assert listed["purchased_totals"] == [{"currency": "BRL", "amount": 6196.39}]
+    shared = client.post(f"/api/lists/{list_id}/share", headers=ana).json()
+    public = client.get(f"/api/share/{shared['short_code']}").json()
+    bought = next(item for item in public["items"] if item["name"] == "PS5")
+    assert bought["purchased"] is True
+    assert public["purchased_totals"] == [{"currency": "BRL", "amount": 6196.39}]
+    cleared = client.patch(f"/api/items/{first.json()['id']}", json={"purchased": False}, headers=ana)
+    assert cleared.json()["purchased"] is False
+    assert cleared.json()["purchased_by_label"] is None
+    assert second["id"]
 
 
 def test_existing_lists_gain_an_owner_membership(tmp_path, monkeypatch):
