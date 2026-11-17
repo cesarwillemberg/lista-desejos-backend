@@ -33,6 +33,8 @@ export JWT_SECRET=dev-only-change-me-please
 | `ANDROID_SHA256_FINGERPRINTS` | placeholder | Comma-separated signing cert fingerprints. Until you set this, the file contains `REPLACE_WITH_SHA256_FINGERPRINT` |
 | `IOS_APP_ID` | `TEAMID.com.wishly.app` | Apple team id plus bundle id for `apple-app-site-association`. Replace `TEAMID` |
 | `CORS_ORIGINS` | `https://cesarwillemberg.github.io` | Comma-separated browser origins. Localhost is always allowed |
+| `WISHLY_AUTH_RATE` | `20` | Logins and sign-ups allowed per IP each minute. `0` turns the limit off |
+| `WISHLY_SCRAPE_RATE` | `30` | Product reads allowed per IP each minute |
 
 ```bash
 pytest

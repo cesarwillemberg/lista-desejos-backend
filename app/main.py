@@ -24,8 +24,9 @@ from starlette.requests import Request
 
 from app import db
 from app.auth import current_user, hash_password, issue_token, jwt_secret, verify_password
-from app.extractor import extract_product, store_name
+from app.extractor import Extracted, extract_product, store_name
 from app.fetch import ensure_public_url, fetch_image
+from app.limit import limit_auth, limit_scrape
 from app.share_codes import new_short_code
 
 _image_cache: OrderedDict[tuple[str, str], tuple[bytes, str]] = OrderedDict()
@@ -490,7 +491,7 @@ def invite_link(code: str, request: Request):
 
 
 @app.post("/api/auth/register", status_code=201)
-def register(body: AuthBody):
+def register(body: AuthBody, _: None = Depends(limit_auth)):
     email = _clean_email(body.email)
     password = _clean_password(body.password)
     user = db.register_user(email, hash_password(password))
@@ -498,7 +499,7 @@ def register(body: AuthBody):
 
 
 @app.post("/api/auth/login")
-def login(body: AuthBody):
+def login(body: AuthBody, _: None = Depends(limit_auth)):
     email = _clean_email(body.email)
     password = _clean_password(body.password)
     found = db.get_user_by_email(email)
@@ -733,7 +734,7 @@ def reorder_categories(list_id: str, body: CategoryOrder, user: dict = Depends(c
 
 
 @app.post("/api/lists/{list_id}/items", status_code=201)
-def create_item(list_id: str, body: ItemCreate, user: dict = Depends(current_user)):
+def create_item(list_id: str, body: ItemCreate, user: dict = Depends(current_user), _: None = Depends(limit_scrape)):
     _access(list_id, user, "editor")
     name = _clean_name(body.name)
     url = (body.url or "").strip()
@@ -818,7 +819,7 @@ def patch_item(item_id: str, body: ItemUpdate, user: dict = Depends(current_user
 
 
 @app.post("/api/items/{item_id}/refresh")
-def refresh_item(item_id: str, user: dict = Depends(current_user)):
+def refresh_item(item_id: str, user: dict = Depends(current_user), _: None = Depends(limit_scrape)):
     current = _require_item(item_id, user)
     extracted = extract_product(current["url"])
     changes: dict = {"store": store_name(current["url"])}

@@ -8,11 +8,14 @@ product page to the impersonated client. httpx remains the fallback.
 from __future__ import annotations
 
 import ipaddress
+import logging
 import socket
 from dataclasses import dataclass
 from urllib.parse import urlparse
 
 import httpx
+
+logger = logging.getLogger("wishly.fetch")
 
 BROWSER_HEADERS = {
     "User-Agent": (
@@ -75,7 +78,8 @@ def ensure_public_url(url: str) -> str:
         if not ips:
             raise ValueError("Não encontramos esse endereço. Confira o link.")
     for ip in ips:
-        if not ip.is_global:
+        if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_multicast or ip.is_reserved or ip.is_unspecified or not ip.is_global:
+            logger.warning("blocked non-public host %s", host)
             raise ValueError("Esse endereço aponta para uma rede interna e não pode ser lido.")
     return url.strip()
 

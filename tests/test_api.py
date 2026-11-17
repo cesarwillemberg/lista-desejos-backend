@@ -235,6 +235,29 @@ def test_refresh_keeps_previous_when_fetch_fails(client, monkeypatch):
     assert "Mantivemos" in refreshed.json()["message"]
 
 
+def test_rate_limit_blocks_repeated_login(client):
+    from app.limit import auth_limiter
+
+    auth_limiter.limit = 2
+    auth_limiter.reset()
+    payload = {"email": "limite@example.com", "password": "senha-forte"}
+    assert client.post("/api/auth/register", json=payload).status_code == 201
+    assert client.post("/api/auth/login", json=payload).status_code == 200
+    blocked = client.post("/api/auth/login", json=payload)
+    assert blocked.status_code == 429
+    assert "minuto" in blocked.json()["detail"]
+    auth_limiter.limit = 10000
+    auth_limiter.reset()
+
+
+def test_scraper_rejects_private_and_non_http(client):
+    headers, _user = _auth(client, "rede@example.com")
+    list_id = client.get("/api/lists", headers=headers).json()["lists"][0]["id"]
+    for url in ("file:///etc/passwd", "ftp://example.com/a", "http://127.0.0.1/x", "http://10.1.1.1/x", "http://169.254.1.1/x"):
+        response = client.post(f"/api/lists/{list_id}/items", json={"name": "Local", "url": url}, headers=headers)
+        assert response.status_code == 400, url
+
+
 def test_private_url_is_not_saved(client):
     headers, _user = _auth(client)
     list_id = client.get("/api/lists", headers=headers).json()["lists"][0]["id"]
