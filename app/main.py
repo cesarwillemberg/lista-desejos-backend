@@ -27,7 +27,7 @@ from starlette.requests import Request
 
 from app import db
 from app.auth import current_user, hash_password, issue_token, jwt_secret, password_needs_rehash, verify_password
-from app.extractor import Extracted, extract_product, store_name
+from app.extractor import PENDING_NAME, Extracted, extract_product, fallback_product_name, store_name
 from app.fetch import ensure_public_url, fetch_image
 from app.limit import limit_auth, limit_scrape
 from app.share_codes import new_short_code
@@ -71,7 +71,7 @@ class CategoryOrder(BaseModel):
 
 class ItemCreate(BaseModel):
     model_config = ConfigDict(extra="ignore")
-    name: str
+    name: str | None = None
     url: str
     category_id: str | None = None
 
@@ -204,6 +204,8 @@ def _present_item(
     purchased_by_label: str | None = None,
 ) -> dict:
     hidden = {"reserved_token_hash", "added_by", "reserved_by", "purchased_by"}
+    if not owner:
+        hidden = hidden | {"scrape_error"}
     data = {key: value for key, value in item.items() if key not in hidden}
     if not owner and not mine:
         data["reserved_label"] = None
@@ -339,6 +341,7 @@ def _fields_from_extraction(extracted: Extracted, url: str) -> dict:
         "message": extracted.message,
         "image_source": extracted.image_source,
         "price_source": extracted.price_source,
+        "scrape_error": (extracted.scrape_error or "")[:240] or None,
     }
 
 
@@ -369,9 +372,9 @@ def _replace_changes(extracted: Extracted, url: str, *, update_name: bool) -> di
         "message": extracted.message,
         "image_source": extracted.image_source,
         "price_source": extracted.price_source,
+        "scrape_error": (extracted.scrape_error or "")[:240] or None,
     }
-    if update_name and extracted.title:
-        changes["name"] = extracted.title[:160]
+    _apply_scraped_name(changes, extracted, url, update_name=update_name)
     return changes
 
 
@@ -400,6 +403,7 @@ def _refresh_changes(extracted: Extracted, url: str, previous: dict) -> dict:
     else:
         changes["status"] = "partial"
         changes["message"] = "Atualizamos o preço, mas a foto continua indisponível."
+    changes["scrape_error"] = (extracted.scrape_error or "")[:240] or None
     return changes
 
 
@@ -409,12 +413,21 @@ def _apply_scrape(item_id: str, url: str, previous: dict | None, *, use_cache: b
         extracted = _cached_extract(url) if use_cache else extract_product(url)
         if replace or previous is None:
             changes = _replace_changes(extracted, url, update_name=update_name) if replace else _fields_from_extraction(extracted, url)
+            if not replace:
+                _apply_scraped_name(changes, extracted, url, update_name=update_name)
         else:
             changes = _refresh_changes(extracted, url, previous)
         db.update_item(item_id, changes)
     except Exception:
         logger.exception("scrape failed for item %s", item_id)
-        failed = {"status": "failed", "message": "Não foi possível ler a página da loja.", "store": store_name(url)}
+        failed = {
+            "status": "failed",
+            "message": "Não consegui ler o preço; edite manualmente",
+            "store": store_name(url),
+            "scrape_error": "exception",
+        }
+        if update_name:
+            failed["name"] = fallback_product_name(url)
         if replace:
             failed["image_url"] = None
             failed["price"] = None
@@ -447,6 +460,24 @@ def schedule_scrape(
     ).start()
 
 
+def _apply_scraped_name(changes: dict, extracted: Extracted, url: str, *, update_name: bool) -> None:
+    if not update_name:
+        return
+    title = (extracted.title or "").strip()
+    changes["name"] = title[:160] if title else fallback_product_name(url)
+
+
+def _enable_info_logs() -> None:
+    import logging
+
+    log = logging.getLogger("wishly")
+    log.setLevel(logging.INFO)
+    if not any(isinstance(handler, logging.StreamHandler) for handler in log.handlers):
+        handler = logging.StreamHandler()
+        handler.setFormatter(logging.Formatter("%(levelname)s %(name)s %(message)s"))
+        log.addHandler(handler)
+
+
 def _needs_db(request: Request) -> bool:
     path = request.url.path
     if path == "/api/health":
@@ -456,6 +487,7 @@ def _needs_db(request: Request) -> bool:
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
+    _enable_info_logs()
     jwt_secret()
     db.migrate()
     db.open_pool()
@@ -510,6 +542,28 @@ app.add_middleware(
 @app.exception_handler(ValueError)
 async def value_error_handler(_request: Request, exc: ValueError):
     return JSONResponse(status_code=400, content={"detail": str(exc)})
+
+
+@app.get("/api/debug/fetch")
+def debug_fetch(url: str, x_wishly_debug: str | None = Header(default=None)):
+    enabled = (os.environ.get("WISHLY_DEBUG_FETCH") or "").strip() == "1"
+    secret = (os.environ.get("WISHLY_DEBUG_TOKEN") or "").strip()
+    if not enabled and not (secret and x_wishly_debug == secret):
+        raise HTTPException(404, "Não encontrado.")
+    ensure_public_url(url)
+    result = extract_product(url)
+    return {
+        "status": result.status,
+        "http_status": result.http_status,
+        "via": result.via,
+        "final_url": result.final_url,
+        "price": result.price,
+        "currency": result.currency,
+        "image_url": result.image_url,
+        "title": result.title,
+        "message": result.message,
+        "scrape_error": result.scrape_error,
+    }
 
 
 @app.get("/api/health")
@@ -889,7 +943,8 @@ def reorder_categories(list_id: str, body: CategoryOrder, user: dict = Depends(c
 @app.post("/api/lists/{list_id}/items", status_code=201)
 def create_item(list_id: str, body: ItemCreate, user: dict = Depends(current_user), _: None = Depends(limit_scrape)):
     _access(list_id, user, "editor")
-    name = _clean_name(body.name)
+    typed = " ".join((body.name or "").split())
+    name = _clean_name(typed) if typed else PENDING_NAME
     url = (body.url or "").strip()
     if len(url) > 2000:
         raise HTTPException(400, "Esse link é longo demais.")
@@ -906,7 +961,7 @@ def create_item(list_id: str, body: ItemCreate, user: dict = Depends(current_use
             "message": "Lendo a página da loja…",
         },
     )
-    schedule_scrape(item["id"], url)
+    schedule_scrape(item["id"], url, update_name=not typed)
     return _present_items([item], member=True, user_id=user["id"])[0]
 
 

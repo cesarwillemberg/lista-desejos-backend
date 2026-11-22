@@ -2,7 +2,14 @@ from pathlib import Path
 
 import pytest
 
-from app.extractor import extract_html, parse_price
+from app.extractor import (
+    PARSE_MESSAGE,
+    extract_html,
+    extract_product,
+    fallback_product_name,
+    parse_price,
+    product_from_kabum_catalog,
+)
 from app.fetch import ensure_public_url
 
 FIXTURES = Path(__file__).parent / "fixtures"
@@ -212,6 +219,58 @@ def test_mercadolivre_verification_page():
     )
     assert result.status == "failed"
     assert "Mercado Livre" in (result.message or "")
+
+
+def test_akamai_mention_inside_a_script_is_not_a_block():
+    html = "<html><head><script>akamai access denied</script><title>TV AOC</title></head><body><p>Sem preço visível</p></body></html>"
+    result = extract_html(html, "https://www.kabum.com.br/produto/1071513/smart-tv", status=200)
+    assert result.message == PARSE_MESSAGE
+    assert (result.scrape_error or "").startswith("parse")
+
+
+def test_kabum_catalog_prefers_discount_and_cleans_title():
+    result = product_from_kabum_catalog(
+        {
+            "attributes": {
+                "title": "Smart Tv 50u7066 - KaBuM!",
+                "price": 2080,
+                "price_with_discount": 1788.8,
+                "images": ["https://images.kabum.com.br/xlarge.jpg"],
+            }
+        },
+        "https://www.kabum.com.br/produto/1071513/smart-tv-50u7066-78g",
+    )
+    assert result is not None
+    assert result.price == 1788.8
+    assert result.currency == "BRL"
+    assert result.title == "Smart Tv 50u7066"
+    assert result.image_url.endswith("xlarge.jpg")
+    assert result.price_source == "kabum-api"
+
+
+def test_kabum_api_is_used_before_the_html_page(monkeypatch):
+    monkeypatch.setattr(
+        "app.extractor.fetch_kabum_product",
+        lambda url: (
+            product_from_kabum_catalog(
+                {"attributes": {"title": "Smart Tv", "price_with_discount": 1788.8, "images": ["https://images.kabum.com.br/a.jpg"]}},
+                url,
+            ),
+            "ok kabum-api",
+        ),
+    )
+
+    def explode(_url):
+        raise AssertionError("html fetch")
+
+    monkeypatch.setattr("app.extractor.fetch_html", explode)
+    result = extract_product("https://www.kabum.com.br/produto/1071513/smart-tv-50u7066-78g")
+    assert result.price == 1788.8
+    assert result.via == "kabum-api"
+
+
+def test_slug_becomes_a_readable_fallback_name():
+    assert fallback_product_name("https://www.kabum.com.br/produto/1071513/smart-tv-50u7066-78g-dled").startswith("Smart Tv 50u7066 78g")
 
 
 def test_private_urls_are_rejected():

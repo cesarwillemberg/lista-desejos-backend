@@ -618,6 +618,107 @@ def test_changing_the_link_replaces_store_and_price(client, monkeypatch):
     assert settled["status"] == "ok"
 
 
+def test_blank_name_uses_the_page_title_and_a_typed_name_stays(client, monkeypatch):
+    monkeypatch.setattr(
+        "app.main.extract_product",
+        lambda url: Extracted(
+            title="Smart Tv 50u7066",
+            price=1788.8,
+            currency="BRL",
+            image_url="https://images.kabum.com.br/tv.jpg",
+            status="ok",
+            price_source="kabum-api",
+            scrape_error="ok kabum-api http=200",
+            final_url=url,
+        ),
+    )
+    headers, _user = _auth(client, "nome@example.com")
+    list_id = client.get("/api/lists", headers=headers).json()["lists"][0]["id"]
+    created = client.post(
+        f"/api/lists/{list_id}/items",
+        json={"url": "https://www.kabum.com.br/produto/1071513/smart-tv-50u7066-78g"},
+        headers=headers,
+    )
+    assert created.status_code == 201
+    assert created.json()["name"] == "Buscando nome…"
+    saved = _saved(client, headers, list_id, created.json()["id"])
+    assert saved["name"] == "Smart Tv 50u7066"
+    assert saved["price"] == 1788.8
+    assert "kabum-api" in (saved["scrape_error"] or "")
+    typed = client.post(
+        f"/api/lists/{list_id}/items",
+        json={"name": "Minha TV", "url": "https://www.kabum.com.br/produto/1/outra-tv"},
+        headers=headers,
+    )
+    assert _saved(client, headers, list_id, typed.json()["id"])["name"] == "Minha TV"
+
+
+def test_failed_scrape_names_the_item_from_the_slug(client, monkeypatch):
+    monkeypatch.setattr(
+        "app.main.extract_product",
+        lambda url: Extracted(status="failed", message="Não consegui ler o preço; edite manualmente", scrape_error="parse http=200", final_url=url),
+    )
+    headers, _user = _auth(client, "slug@example.com")
+    list_id = client.get("/api/lists", headers=headers).json()["lists"][0]["id"]
+    created = client.post(
+        f"/api/lists/{list_id}/items",
+        json={"url": "https://www.kabum.com.br/produto/1071513/smart-tv-50u7066-78g"},
+        headers=headers,
+    )
+    saved = _saved(client, headers, list_id, created.json()["id"])
+    assert saved["name"].startswith("Smart Tv 50u7066 78g")
+    assert saved["message"] == "Não consegui ler o preço; edite manualmente"
+
+
+def test_refresh_replaces_a_missing_price(client, monkeypatch):
+    calls = {"n": 0}
+
+    def fake(url):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return Extracted(status="failed", message="Não consegui ler o preço; edite manualmente", scrape_error="parse", title="TV", final_url=url)
+        return Extracted(
+            status="ok",
+            title="TV",
+            price=1788.8,
+            currency="BRL",
+            image_url="https://images.kabum.com.br/tv.jpg",
+            price_source="kabum-api",
+            scrape_error="ok kabum-api",
+            final_url=url,
+        )
+
+    monkeypatch.setattr("app.main.extract_product", fake)
+    headers, _user = _auth(client, "atualizar@example.com")
+    list_id = client.get("/api/lists", headers=headers).json()["lists"][0]["id"]
+    created = client.post(
+        f"/api/lists/{list_id}/items",
+        json={"name": "TV da sala", "url": "https://www.kabum.com.br/produto/1071513/smart-tv"},
+        headers=headers,
+    )
+    item_id = created.json()["id"]
+    assert _saved(client, headers, list_id, item_id)["price"] is None
+    refreshed = client.post(f"/api/items/{item_id}/refresh", headers=headers)
+    assert refreshed.status_code == 200
+    saved = _saved(client, headers, list_id, item_id)
+    assert saved["name"] == "TV da sala"
+    assert saved["price"] == 1788.8
+    assert saved["image_url"].endswith("tv.jpg")
+
+
+def test_debug_fetch_stays_off_unless_enabled(client, monkeypatch):
+    assert client.get("/api/debug/fetch", params={"url": "https://example.com/produto"}).status_code == 404
+    monkeypatch.setenv("WISHLY_DEBUG_FETCH", "1")
+    monkeypatch.setattr(
+        "app.main.extract_product",
+        lambda url: Extracted(status="ok", price=10, currency="BRL", title="Copo", scrape_error="ok parse", http_status=200, via="test", final_url=url),
+    )
+    opened = client.get("/api/debug/fetch", params={"url": "https://example.com/produto"})
+    assert opened.status_code == 200
+    assert opened.json()["scrape_error"] == "ok parse"
+    assert opened.json()["price"] == 10
+
+
 def test_health_can_time_the_database(client):
     response = client.get("/api/health?db=1")
     assert response.status_code == 200

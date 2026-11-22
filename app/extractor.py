@@ -25,6 +25,13 @@ from app.fetch import FetchResult, fetch_html
 logger = logging.getLogger("wishly.extract")
 
 BLOCKED_MESSAGE = "Essa loja bloqueia a busca automática; edite o preço manualmente"
+PARSE_MESSAGE = "Não consegui ler o preço; edite manualmente"
+PENDING_NAME = "Buscando nome…"
+_KABUM_ID = re.compile(r"/produto/(\d+)")
+_STORE_SUFFIX = re.compile(
+    r"\s+[\|\-–—]\s+(kabum!?|magazine luiza|magalu|mercado livre|amazon(\.com\.br)?|americanas|casas bahia|shopee|ponto|extra)\s*$",
+    re.IGNORECASE,
+)
 
 _TYPE_SPLIT = re.compile(r"[/#:]")
 
@@ -42,6 +49,7 @@ class Extracted:
     http_status: int | None = None
     final_url: str | None = None
     via: str | None = None
+    scrape_error: str | None = None
 
 
 @dataclass
@@ -83,15 +91,35 @@ class _Draft:
     def set_title(self, value, source: str) -> None:
         if self.title or not isinstance(value, str):
             return
-        text = " ".join(value.split())
+        text = clean_product_title(value)
         if text:
             self.title = text[:180]
             self.title_source = source
 
 
 def extract_product(url: str) -> Extracted:
+    api_product, api_note = fetch_kabum_product(url)
+    if api_product is not None and api_product.price is not None:
+        logger.info("scrape %s", api_product.scrape_error)
+        return api_product
     fetched = fetch_html(url)
-    return _from_fetch(fetched)
+    result = _from_fetch(fetched)
+    if result.price is None and api_product is not None and api_product.price is not None:
+        result = api_product
+    elif api_note and result.price is None:
+        result.scrape_error = f"{result.scrape_error}; {api_note}"[:240]
+    logger.info(
+        "scrape url=%s http=%s via=%s final=%s len=%s price=%s image=%s err=%s",
+        url,
+        result.http_status,
+        result.via,
+        result.final_url,
+        result.scrape_error,
+        result.price,
+        bool(result.image_url),
+        result.message,
+    )
+    return result
 
 
 def extract_html(html: str, url: str, *, status: int = 200, final_url: str | None = None) -> Extracted:
@@ -102,13 +130,15 @@ def extract_html(html: str, url: str, *, status: int = 200, final_url: str | Non
 def _from_fetch(fetched: FetchResult) -> Extracted:
     final_url = fetched.final_url or fetched.url
     if not fetched.html:
-        message = fetched.error or "Não foi possível acessar a página da loja."
+        kind, reason = _classify(None, fetched)
+        message = BLOCKED_MESSAGE if kind == "blocked" else PARSE_MESSAGE
         return Extracted(
             status="failed",
             message=message,
             http_status=fetched.status,
             final_url=final_url,
             via=fetched.via,
+            scrape_error=_scrape_note(kind, reason, fetched),
         )
     draft = _Draft(base=final_url)
     soup = BeautifulSoup(fetched.html, "lxml")
@@ -121,6 +151,7 @@ def _from_fetch(fetched: FetchResult) -> Extracted:
         lambda: _apply_embedded_json(soup, draft),
         lambda: _apply_visible_price(soup, draft),
         lambda: _apply_generic_image(soup, draft),
+        lambda: _apply_document_title(soup, draft),
     ):
         try:
             step()
@@ -182,6 +213,134 @@ def currency_from_text(value: str | None) -> str | None:
     return None
 
 
+def clean_product_title(value: str) -> str:
+    text = " ".join((value or "").split())
+    previous = None
+    while text and text != previous:
+        previous = text
+        text = _STORE_SUFFIX.sub("", text).strip(" |-–—")
+    return text[:160]
+
+
+def kabum_product_id(url: str) -> str | None:
+    host = (urlparse(url).hostname or "").lower()
+    if "kabum." not in host:
+        return None
+    match = _KABUM_ID.search(urlparse(url).path)
+    return match.group(1) if match else None
+
+
+def fallback_product_name(url: str) -> str:
+    segments = [part for part in urlparse(url).path.split("/") if part]
+    slug = ""
+    for segment in reversed(segments):
+        if segment.isdigit() or segment.lower() in {"produto", "product", "p", "dp", "item"}:
+            continue
+        slug = segment
+        break
+    if slug:
+        words = [word for word in re.split(r"[-_]+", slug) if word]
+        human = " ".join(word[:1].upper() + word[1:] for word in words)
+        if len(human) > 3:
+            return human[:160]
+    return f"{store_name(url)} produto"
+
+
+def _positive_price(value) -> float | None:
+    parsed = parse_price(value)
+    if parsed is None or parsed <= 0:
+        return None
+    return parsed
+
+
+def product_from_kabum_catalog(payload: dict, url: str) -> Extracted | None:
+    attrs = payload.get("attributes") if isinstance(payload, dict) else None
+    if not isinstance(attrs, dict):
+        return None
+    price = _positive_price(attrs.get("price_with_discount")) or _positive_price(attrs.get("price"))
+    images = attrs.get("images") if isinstance(attrs.get("images"), list) else []
+    image = next((item for item in images if isinstance(item, str) and item.startswith("http")), None)
+    title = clean_product_title(attrs.get("title") or "")
+    if price is None and not image and not title:
+        return None
+    return Extracted(
+        image_url=image,
+        price=price,
+        currency="BRL" if price is not None else None,
+        title=title or None,
+        status="ok" if price is not None and image else "partial",
+        message=None if price is not None else PARSE_MESSAGE,
+        image_source="kabum-api" if image else None,
+        price_source="kabum-api" if price is not None else None,
+        final_url=url,
+        via="kabum-api",
+    )
+
+
+def product_from_kabum_description(payload: dict, url: str) -> Extracted | None:
+    if not isinstance(payload, dict):
+        return None
+    price = _positive_price(payload.get("preco_desconto")) or _positive_price(payload.get("preco"))
+    photos = payload.get("fotos") if isinstance(payload.get("fotos"), list) else []
+    image = next((item for item in photos if isinstance(item, str) and item.startswith("http")), None)
+    title = clean_product_title(str(payload.get("nome") or ""))
+    if price is None and not image and not title:
+        return None
+    return Extracted(
+        image_url=image,
+        price=price,
+        currency="BRL" if price is not None else None,
+        title=title or None,
+        status="ok" if price is not None and image else "partial",
+        message=None if price is not None else PARSE_MESSAGE,
+        image_source="kabum-api" if image else None,
+        price_source="kabum-api" if price is not None else None,
+        final_url=url,
+        via="kabum-api",
+    )
+
+
+def fetch_kabum_product(url: str) -> tuple[Extracted | None, str]:
+    product_id = kabum_product_id(url)
+    if not product_id:
+        return None, ""
+    import httpx
+
+    from app.fetch import BROWSER_HEADERS
+
+    headers = {
+        **BROWSER_HEADERS,
+        "Accept": "application/json,text/plain,*/*",
+        "Origin": "https://www.kabum.com.br",
+        "Referer": "https://www.kabum.com.br/",
+    }
+    catalog = f"https://servicespub.prod.api.aws.grupokabum.com.br/catalog/v2/products/{product_id}"
+    description = f"https://servicespub.prod.api.aws.grupokabum.com.br/descricao/v1/descricao/produto/{product_id}"
+    notes: list[str] = []
+    try:
+        with httpx.Client(timeout=10, follow_redirects=True, headers=headers, http2=True) as client:
+            for endpoint, parser in ((catalog, product_from_kabum_catalog), (description, product_from_kabum_description)):
+                response = client.get(endpoint)
+                note = f"kabum-api {endpoint.rsplit('/', 2)[-2]} http={response.status_code} len={len(response.content)} id={product_id}"
+                notes.append(note)
+                logger.info("fetch %s", note)
+                if response.status_code != 200:
+                    continue
+                try:
+                    parsed = parser(response.json(), url)
+                except ValueError:
+                    continue
+                if parsed is not None and parsed.price is not None:
+                    parsed.http_status = response.status_code
+                    parsed.final_url = str(response.url)
+                    parsed.scrape_error = note[:240]
+                    return parsed, note
+    except Exception as exc:
+        logger.info("kabum api failed id=%s err=%s", product_id, exc)
+        notes.append(f"kabum-api error {type(exc).__name__}")
+    return None, "; ".join(notes)[:240]
+
+
 def store_name(url: str) -> str:
     host = (urlparse(url).hostname or "").lower()
     if host.startswith("www."):
@@ -229,23 +388,80 @@ def _number_from_token(token: str, *, br_text: bool) -> float | None:
         return None
 
 
+def _apply_document_title(soup: BeautifulSoup, draft: _Draft) -> None:
+    if soup.title is None:
+        return
+    draft.set_title(soup.title.get_text(" ", strip=True), "html:title")
+
+
+def _visible_text(soup: BeautifulSoup) -> str:
+    title = soup.title.get_text(" ", strip=True) if soup.title else ""
+    chunks = [title]
+    for child in soup.find_all(string=True):
+        parent = getattr(child, "parent", None)
+        name = getattr(parent, "name", "") or ""
+        if name in {"script", "style", "noscript"}:
+            continue
+        text = " ".join(str(child).split())
+        if text:
+            chunks.append(text)
+        if sum(len(part) for part in chunks) > 1800:
+            break
+    return " ".join(chunks).lower()
+
+
+def _classify(soup: BeautifulSoup | None, fetched: FetchResult) -> tuple[str, str]:
+    final = (fetched.final_url or fetched.url or "").lower()
+    if fetched.status in {401, 403, 429, 503}:
+        return "blocked", f"http-{fetched.status}"
+    if not fetched.html:
+        return "network", fetched.error or "empty"
+    if any(token in final for token in ("account-verification", "validatecaptcha", "captcha", "/gz/")):
+        return "blocked", "challenge-url"
+    visible = _visible_text(soup) if soup is not None else ""
+    for token in (
+        "access denied",
+        "não é possível acessar",
+        "nao e possivel acessar",
+        "robot check",
+        "pardon our interruption",
+        "verificação de acesso",
+    ):
+        if token in visible:
+            return "blocked", token
+    return "parse", "no-price"
+
+
+def _scrape_note(kind: str, reason: str, fetched: FetchResult) -> str:
+    final = (fetched.final_url or fetched.url or "")[:140]
+    return f"{kind} reason={reason} http={fetched.status} via={fetched.via} len={len(fetched.html or '')} final={final}"[:240]
+
+
 def _finish(draft: _Draft, fetched: FetchResult, soup: BeautifulSoup) -> Extracted:
     if draft.price is not None and not draft.currency:
         host = (urlparse(draft.base).hostname or "").lower()
         if host.endswith(".br"):
             draft.currency = "BRL"
-    if draft.image is None and draft.price is None:
-        message = _block_message(soup, fetched) or fetched.error or "Não encontramos foto nem preço nessa página."
+    kind, reason = _classify(soup, fetched)
+    if draft.price is None and kind == "blocked":
+        final = (fetched.final_url or fetched.url or "").lower()
+        if "mercado" in final and "account-verification" in final:
+            message = "O Mercado Livre pediu uma verificação de acesso e não entregou a página do produto."
+        else:
+            message = BLOCKED_MESSAGE
         status = "failed"
-    elif draft.image and draft.price is not None:
-        message = None
-        status = "ok"
-    elif draft.image:
-        message = "Encontramos a foto, mas o preço não estava na página. Você pode informá-lo."
-        status = "partial"
-    else:
+    elif draft.price is None:
+        message = PARSE_MESSAGE
+        status = "partial" if draft.image else "failed"
+        kind = "network" if kind == "network" else "parse"
+    elif draft.image is None:
         message = "Encontramos o preço, mas não a foto. Você pode informar a imagem."
         status = "partial"
+        kind, reason = "ok", "price-only"
+    else:
+        message = None
+        status = "ok"
+        kind, reason = "ok", draft.price_source or "parsed"
     return Extracted(
         image_url=draft.image,
         price=round(draft.price, 2) if draft.price is not None else None,
@@ -258,35 +474,8 @@ def _finish(draft: _Draft, fetched: FetchResult, soup: BeautifulSoup) -> Extract
         http_status=fetched.status,
         final_url=fetched.final_url,
         via=fetched.via,
+        scrape_error=_scrape_note(kind, reason, fetched),
     )
-
-
-def _block_message(soup: BeautifulSoup, fetched: FetchResult) -> str | None:
-    html = str(soup).lower()
-    final = (fetched.final_url or fetched.url or "").lower()
-    title = soup.title.get_text(" ", strip=True).lower() if soup.title else ""
-    if "account-verification" in final or "suspicious-traffic" in html or "gz-account-verification" in html:
-        return "O Mercado Livre pediu uma verificação de acesso e não entregou a página do produto."
-    blocked = fetched.status in {401, 403, 429} or any(
-        token in html or token in title
-        for token in (
-            "akamai",
-            "access denied",
-            "edgesuite",
-            "não é possível acessar",
-            "nao e possivel acessar",
-            "validatecaptcha",
-            "robot check",
-            "pardon our interruption",
-        )
-    )
-    if blocked:
-        return BLOCKED_MESSAGE
-    if fetched.status in {503} and "amazon." in final:
-        return "A Amazon não entregou a página do produto."
-    if fetched.status and fetched.status >= 400:
-        return f"A loja respondeu com o erro {fetched.status}."
-    return None
 
 
 def _apply_extruct(html: str, url: str, draft: _Draft) -> None:

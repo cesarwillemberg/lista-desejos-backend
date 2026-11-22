@@ -102,6 +102,18 @@ def _worth_keeping(result: FetchResult | None) -> bool:
     return bool(result and result.status and result.status < 400 and len(result.html or "") > 800)
 
 
+def _log_fetch(url: str, result: FetchResult) -> FetchResult:
+    logger.info(
+        "fetch status=%s via=%s final=%s len=%s url=%s",
+        result.status,
+        result.via,
+        result.final_url,
+        len(result.html or ""),
+        url,
+    )
+    return result
+
+
 def fetch_html(url: str, timeout: float = 10.0) -> FetchResult:
     ensure_public_url(url)
     primary: FetchResult | None = None
@@ -113,26 +125,26 @@ def fetch_html(url: str, timeout: float = 10.0) -> FetchResult:
         primary = FetchResult(False, url, url, None, "", "A página demorou demais para responder.", "curl_cffi")
     except Exception:
         logger.info("curl_cffi could not fetch %s", url)
-    if _worth_keeping(primary):
-        return primary
+    if primary is not None and _worth_keeping(primary):
+        return _log_fetch(url, primary)
     try:
         secondary = _with_httpx(url, timeout)
     except ValueError:
         raise
     except TimeoutError:
         if primary is not None:
-            return primary
-        return FetchResult(False, url, url, None, "", "A página demorou demais para responder.", "httpx")
+            return _log_fetch(url, primary)
+        return _log_fetch(url, FetchResult(False, url, url, None, "", "A página demorou demais para responder.", "httpx"))
     except Exception:
         logger.info("httpx could not fetch %s", url)
         secondary = None
-    if _worth_keeping(secondary):
-        return secondary
+    if secondary is not None and _worth_keeping(secondary):
+        return _log_fetch(url, secondary)
     if primary is not None and (secondary is None or (primary.status or 999) <= (secondary.status or 999)):
-        return primary
+        return _log_fetch(url, primary)
     if secondary is not None:
-        return secondary
-    return FetchResult(False, url, url, None, "", "Não foi possível acessar a página da loja.", None)
+        return _log_fetch(url, secondary)
+    return _log_fetch(url, FetchResult(False, url, url, None, "", "Não foi possível acessar a página da loja.", None))
 
 
 def fetch_image(url: str, referer: str | None, timeout: float = 15.0) -> tuple[bytes, str]:
