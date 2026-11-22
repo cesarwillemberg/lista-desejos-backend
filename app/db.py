@@ -332,7 +332,9 @@ def _count(row) -> int:
 
 
 def row_to_user(row) -> dict:
-    return {"id": row["id"], "email": row["email"], "created_at": row["created_at"]}
+    keys = row.keys()
+    alerts = row["email_price_alerts"] if "email_price_alerts" in keys else 1
+    return {"id": row["id"], "email": row["email"], "created_at": row["created_at"], "email_price_alerts": bool(alerts)}
 
 
 def money_totals(items: list[dict]) -> list[dict]:
@@ -392,6 +394,13 @@ def row_to_item(row) -> dict:
         "purchased": bool(row["purchased"]) if "purchased" in row.keys() else False,
         "purchased_at": row["purchased_at"] if "purchased_at" in row.keys() else None,
         "purchased_by": row["purchased_by"] if "purchased_by" in row.keys() else None,
+        "priority": row["priority"] if "priority" in row.keys() and row["priority"] else "quero",
+        "position": int(row["position"]) if "position" in row.keys() and row["position"] is not None else 0,
+        "note": row["note"] if "note" in row.keys() else None,
+        "color": row["color"] if "color" in row.keys() else None,
+        "size_label": row["size_label"] if "size_label" in row.keys() else None,
+        "voltage": row["voltage"] if "voltage" in row.keys() else None,
+        "quantity": int(row["quantity"]) if "quantity" in row.keys() and row["quantity"] is not None else None,
         "created_at": row["created_at"],
         "updated_at": row["updated_at"],
     }
@@ -455,7 +464,7 @@ def public_item(item: dict, *, mine: bool) -> dict:
 
 def get_user(user_id: str) -> dict | None:
     with connect() as conn:
-        row = conn.execute("SELECT id, email, created_at FROM users WHERE id = ?", (user_id,)).fetchone()
+        row = conn.execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone()
     return row_to_user(row) if row else None
 
 
@@ -654,6 +663,10 @@ def _summary(row, role: str, counts: dict, totals: dict, members: dict) -> dict:
         "members": members.get(list_id, []),
         "invite_editor_code": row["invite_editor_code"] if "invite_editor_code" in keys else None,
         "invite_viewer_code": row["invite_viewer_code"] if "invite_viewer_code" in keys else None,
+        "reservations_enabled": bool(row["reservations_enabled"]) if "reservations_enabled" in keys else True,
+        "show_reservations": bool(row["show_reservations"]) if "show_reservations" in keys else False,
+        "budget": _money(row["budget"]) if "budget" in keys else None,
+        "budget_currency": row["budget_currency"] if "budget_currency" in keys else None,
     }
 
 
@@ -778,9 +791,11 @@ def get_list_by_share_token(token: str) -> dict | None:
                 (row["id"],),
             ).fetchall()
         ]
-    payload = row_to_list(row, items)
-    payload["items"] = items
-    return payload
+        payload = row_to_list(row, items)
+        keys = row.keys()
+        payload["reservations_enabled"] = bool(row["reservations_enabled"]) if "reservations_enabled" in keys else True
+        payload["items"] = items
+        return payload
 
 
 def list_items(list_id: str) -> list[dict]:
@@ -815,13 +830,21 @@ def insert_item(list_id: str, fields: dict) -> dict:
     now = utc_now()
     item_id = str(uuid4())
     with connect() as conn:
+        if fields.get("position") is None:
+            current = conn.execute(
+                "SELECT COALESCE(MAX(position), -1) + 1 AS next_pos FROM items WHERE list_id = ?",
+                (list_id,),
+            ).fetchone()
+            position = int(current["next_pos"])
+        else:
+            position = int(fields["position"])
         conn.execute(
             """
             INSERT INTO items (
               id, list_id, category_id, name, url, image_url, price, currency, store, status, message,
               image_source, price_source, reserved_label, reserved_token_hash, reserved_at, reserved_by,
-              added_by, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+              added_by, priority, position, note, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 item_id,
@@ -842,6 +865,9 @@ def insert_item(list_id: str, fields: dict) -> dict:
                 None,
                 None,
                 fields.get("added_by"),
+                fields.get("priority") or "quero",
+                position,
+                fields.get("note"),
                 now,
                 now,
             ),
@@ -876,6 +902,13 @@ def update_item(item_id: str, fields: dict) -> dict | None:
         "purchased",
         "purchased_at",
         "purchased_by",
+        "priority",
+        "position",
+        "note",
+        "color",
+        "size_label",
+        "voltage",
+        "quantity",
     }
     changes = {key: value for key, value in fields.items() if key in allowed}
     if not changes:
@@ -1083,3 +1116,164 @@ def delete_item(item_id: str) -> bool:
         cursor = conn.execute("DELETE FROM items WHERE id = ?", (item_id,))
         conn.execute("UPDATE lists SET updated_at = ? WHERE id = ?", (utc_now(), current["list_id"]))
         return cursor.rowcount > 0
+
+
+def set_email_price_alerts(user_id: str, enabled: bool) -> dict | None:
+    with connect() as conn:
+        conn.execute("UPDATE users SET email_price_alerts = ? WHERE id = ?", (1 if enabled else 0, user_id))
+    return get_user(user_id)
+
+
+def update_list_settings(list_id: str, user_id: str, fields: dict) -> dict | None:
+    allowed = {"reservations_enabled", "show_reservations", "budget", "budget_currency"}
+    changes = {key: value for key, value in fields.items() if key in allowed}
+    if not changes:
+        return get_owned_list(list_id, user_id)
+    changes["updated_at"] = utc_now()
+    assignments = ", ".join(f"{key} = ?" for key in changes)
+    with connect() as conn:
+        cursor = conn.execute(
+            f"UPDATE lists SET {assignments} WHERE id = ? AND user_id = ?",
+            (*changes.values(), list_id, user_id),
+        )
+        if cursor.rowcount == 0:
+            return None
+    return get_owned_list(list_id, user_id)
+
+
+def record_price(item_id: str, price: float, currency: str | None) -> dict:
+    """Append a price check. Returns the previous point, when there was one."""
+    now = utc_now()
+    with connect() as conn:
+        previous = conn.execute(
+            "SELECT price, currency, checked_at FROM price_history WHERE item_id = ? ORDER BY checked_at DESC LIMIT 1",
+            (item_id,),
+        ).fetchone()
+        first = conn.execute(
+            "SELECT price, currency, checked_at FROM price_history WHERE item_id = ? ORDER BY checked_at ASC LIMIT 1",
+            (item_id,),
+        ).fetchone()
+        conn.execute(
+            "INSERT INTO price_history (id, item_id, price, currency, checked_at) VALUES (?, ?, ?, ?, ?)",
+            (str(uuid4()), item_id, round(float(price), 2), currency, now),
+        )
+    return {
+        "previous": None if previous is None else round(float(previous["price"]), 2),
+        "first": None if first is None else round(float(first["price"]), 2),
+        "currency": None if previous is None else previous["currency"],
+    }
+
+
+def price_history(item_id: str) -> list[dict]:
+    with connect() as conn:
+        rows = conn.execute(
+            "SELECT price, currency, checked_at FROM price_history WHERE item_id = ? ORDER BY checked_at ASC",
+            (item_id,),
+        ).fetchall()
+    return [{"price": round(float(row["price"]), 2), "currency": row["currency"], "checked_at": row["checked_at"]} for row in rows]
+
+
+def history_for_items(item_ids: list[str]) -> dict[str, list[dict]]:
+    if not item_ids:
+        return {}
+    marks, params = _marks(item_ids)
+    with connect() as conn:
+        rows = conn.execute(
+            f"SELECT item_id, price, currency, checked_at FROM price_history WHERE item_id IN ({marks}) ORDER BY checked_at ASC",
+            params,
+        ).fetchall()
+    grouped: dict[str, list[dict]] = {}
+    for row in rows:
+        grouped.setdefault(row["item_id"], []).append(
+            {"price": round(float(row["price"]), 2), "currency": row["currency"], "checked_at": row["checked_at"]}
+        )
+    return grouped
+
+
+def items_due_for_price_check(limit: int = 15) -> list[dict]:
+    with connect() as conn:
+        rows = conn.execute(
+            """
+            SELECT items.* FROM items
+            LEFT JOIN (
+              SELECT item_id, MAX(checked_at) AS checked_at FROM price_history GROUP BY item_id
+            ) latest ON latest.item_id = items.id
+            WHERE COALESCE(items.purchased, 0) = 0 AND items.price IS NOT NULL
+            ORDER BY latest.checked_at IS NOT NULL, latest.checked_at ASC
+            LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()
+    return [row_to_item(row) for row in rows]
+
+
+def editors_of_list(list_id: str) -> list[dict]:
+    with connect() as conn:
+        rows = conn.execute(
+            """
+            SELECT users.id, users.email, users.email_price_alerts, list_members.role
+            FROM list_members
+            JOIN users ON users.id = list_members.user_id
+            WHERE list_members.list_id = ? AND list_members.role IN ('owner', 'editor')
+            """,
+            (list_id,),
+        ).fetchall()
+    return [
+        {
+            "id": row["id"],
+            "email": row["email"],
+            "role": row["role"],
+            "email_price_alerts": bool(row["email_price_alerts"]),
+        }
+        for row in rows
+    ]
+
+
+def add_notification(user_id: str, kind: str, title: str, body: str, *, item_id: str | None, list_id: str | None) -> None:
+    with connect() as conn:
+        conn.execute(
+            """
+            INSERT INTO notifications (id, user_id, kind, title, body, item_id, list_id, read_at, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?)
+            """,
+            (str(uuid4()), user_id, kind, title, body, item_id, list_id, utc_now()),
+        )
+
+
+def notifications_for(user_id: str) -> list[dict]:
+    with connect() as conn:
+        rows = conn.execute(
+            "SELECT * FROM notifications WHERE user_id = ? ORDER BY created_at DESC LIMIT 40",
+            (user_id,),
+        ).fetchall()
+    return [
+        {
+            "id": row["id"],
+            "kind": row["kind"],
+            "title": row["title"],
+            "body": row["body"],
+            "item_id": row["item_id"],
+            "list_id": row["list_id"],
+            "read": row["read_at"] is not None,
+            "created_at": row["created_at"],
+        }
+        for row in rows
+    ]
+
+
+def reorder_items(list_id: str, ids: list[str]) -> None:
+    with connect() as conn:
+        rows = conn.execute("SELECT id FROM items WHERE list_id = ?", (list_id,)).fetchall()
+        existing = {row["id"] for row in rows}
+        if len(ids) != len(existing) or set(ids) != existing:
+            raise ValueError("A ordem precisa incluir cada item da lista uma vez.")
+        for position, item_id in enumerate(ids):
+            conn.execute("UPDATE items SET position = ? WHERE id = ? AND list_id = ?", (position, item_id, list_id))
+
+
+def mark_notifications_read(user_id: str) -> None:
+    with connect() as conn:
+        conn.execute(
+            "UPDATE notifications SET read_at = ? WHERE user_id = ? AND read_at IS NULL",
+            (utc_now(), user_id),
+        )

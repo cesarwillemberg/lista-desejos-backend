@@ -1,0 +1,28 @@
+# 12:00 UTC is 09:00 in Brasília (BRT, UTC−3). GitHub schedules are best-effort.
+name: Check prices
+
+on:
+  schedule:
+    - cron: "0 12 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Skip when the secret is missing
+        env:
+          WISHLY_CRON_SECRET: ${{ secrets.WISHLY_CRON_SECRET }}
+        run: |
+          if [ -z "$WISHLY_CRON_SECRET" ]; then
+            echo "WISHLY_CRON_SECRET is not set; skipping."
+            exit 0
+          fi
+          curl --fail --silent --show-error --max-time 120 \
+            -X POST \
+            -H "X-Cron-Secret: $WISHLY_CRON_SECRET" \
+            "https://lista-desejos-backend.onrender.com/api/cron/check-prices"

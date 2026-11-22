@@ -131,7 +131,11 @@ def test_share_link_is_read_only_and_can_be_revoked(client, monkeypatch):
     assert stranger["items"][0]["reserved"] is True
     assert stranger["items"][0]["reserved_label"] is None
     owner = client.get(f"/api/lists/{list_id}/items", headers=headers).json()
-    assert owner["items"][0]["reserved_label"] == "Marina"
+    assert owner["items"][0]["reserved"] is False
+    shown = client.patch(f"/api/lists/{list_id}/settings", json={"show_reservations": True}, headers=headers)
+    assert shown.status_code == 200
+    revealed = client.get(f"/api/lists/{list_id}/items", headers=headers).json()
+    assert revealed["items"][0]["reserved_label"] == "Marina"
 
     cleared = client.delete(
         f"/api/share/{token}/items/{item['id']}/reservation",
@@ -755,6 +759,84 @@ def test_refresh_replaces_a_missing_price(client, monkeypatch):
     assert saved["name"] == "TV da sala"
     assert saved["price"] == 1788.8
     assert saved["image_url"].endswith("tv.jpg")
+
+
+def test_price_drop_is_recorded_and_cron_stays_off(client, monkeypatch):
+    prices = {"n": 0}
+
+    def fake(url):
+        prices["n"] += 1
+        return Extracted(title="TV", price=100 if prices["n"] == 1 else 80, currency="BRL", status="ok", image_url="https://images.example.com/tv.jpg", final_url=url)
+
+    monkeypatch.setattr("app.main.extract_product", fake)
+    headers, _user = _auth(client, "preco@example.com")
+    assert client.post("/api/cron/check-prices").status_code == 404
+    list_id = client.get("/api/lists", headers=headers).json()["lists"][0]["id"]
+    created = client.post(
+        f"/api/lists/{list_id}/items",
+        json={"name": "TV", "url": "https://www.kabum.com.br/produto/1/tv"},
+        headers=headers,
+    )
+    item_id = created.json()["id"]
+    client.post(f"/api/items/{item_id}/refresh", headers=headers)
+    listed = client.get(f"/api/lists/{list_id}/items", headers=headers).json()
+    item = next(entry for entry in listed["items"] if entry["id"] == item_id)
+    assert item["price"] == 80
+    assert item["price_drop"] == 20
+    history = client.get(f"/api/items/{item_id}/prices", headers=headers).json()
+    assert history["lowest"] == 80
+    assert history["highest"] == 100
+    notes = client.get("/api/notifications", headers=headers).json()
+    assert notes["unread"] >= 1
+
+
+def test_notes_details_and_manual_order(client, monkeypatch):
+    monkeypatch.setattr("app.main.extract_product", lambda url: Extracted(status="failed", final_url=url))
+    headers, _user = _auth(client, "ordem@example.com")
+    list_id = client.get("/api/lists", headers=headers).json()["lists"][0]["id"]
+
+    def add(name):
+        response = client.post(
+            f"/api/lists/{list_id}/items",
+            json={"name": name, "url": f"https://www.kabum.com.br/produto/{name}", "priority": "talvez", "note": "rascunho"},
+            headers=headers,
+        )
+        assert response.status_code == 201, response.text
+        return response.json()["id"]
+
+    first = add("alfa")
+    second = add("beta")
+    patched = client.patch(
+        f"/api/items/{first}",
+        json={"priority": "muito", "note": "Presente da sala", "color": "azul", "size_label": "M", "voltage": "110V", "quantity": 2},
+        headers=headers,
+    )
+    assert patched.status_code == 200, patched.text
+    body = patched.json()
+    assert body["priority"] == "muito"
+    assert body["note"] == "Presente da sala"
+    assert body["color"] == "azul"
+    assert body["size_label"] == "M"
+    assert body["voltage"] == "110V"
+    assert body["quantity"] == 2
+    cleared = client.patch(f"/api/items/{first}", json={"color": "", "quantity": None}, headers=headers)
+    assert cleared.json()["color"] is None
+    assert cleared.json()["quantity"] is None
+    rejected = client.post(f"/api/lists/{list_id}/items/reorder", json={"ids": [second]}, headers=headers)
+    assert rejected.status_code == 400
+    ordered = client.post(f"/api/lists/{list_id}/items/reorder", json={"ids": [second, first]}, headers=headers)
+    assert ordered.status_code == 200
+    listed = client.get(f"/api/lists/{list_id}/items", headers=headers).json()["items"]
+    by_id = {item["id"]: item for item in listed}
+    assert by_id[second]["position"] < by_id[first]["position"]
+    assert by_id[second]["note"] == "rascunho"
+    assert by_id[second]["priority"] == "talvez"
+
+
+def test_extension_origin_is_allowed(client):
+    response = client.get("/api/health", headers={"Origin": "chrome-extension://abcdefghijklmnop"})
+    assert response.status_code == 200
+    assert response.headers["access-control-allow-origin"] == "chrome-extension://abcdefghijklmnop"
 
 
 def test_debug_fetch_stays_off_unless_enabled(client, monkeypatch):

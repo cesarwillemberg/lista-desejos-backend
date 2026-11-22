@@ -69,11 +69,18 @@ class CategoryOrder(BaseModel):
     ids: list[str]
 
 
+class ItemOrder(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+    ids: list[str]
+
+
 class ItemCreate(BaseModel):
     model_config = ConfigDict(extra="ignore")
     name: str | None = None
     url: str
     category_id: str | None = None
+    priority: str | None = None
+    note: str | None = None
 
 
 class ItemUpdate(BaseModel):
@@ -85,6 +92,26 @@ class ItemUpdate(BaseModel):
     currency: str | None = None
     category_id: str | None = None
     purchased: bool | None = None
+    priority: str | None = None
+    position: int | None = None
+    note: str | None = None
+    color: str | None = None
+    size_label: str | None = None
+    voltage: str | None = None
+    quantity: int | None = None
+
+
+class ListSettings(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+    reservations_enabled: bool | None = None
+    show_reservations: bool | None = None
+    budget: float | None = None
+    budget_currency: str | None = None
+
+
+class AlertSetting(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+    email_price_alerts: bool
 
 
 class MemberBody(BaseModel):
@@ -202,20 +229,30 @@ def _present_item(
     mine: bool,
     added_by_label: str | None = None,
     purchased_by_label: str | None = None,
+    reveal_reservations: bool = True,
 ) -> dict:
     hidden = {"reserved_token_hash", "added_by", "reserved_by", "purchased_by"}
     if not owner:
         hidden = hidden | {"scrape_error"}
     data = {key: value for key, value in item.items() if key not in hidden}
-    if not owner and not mine:
+    if not reveal_reservations:
+        data["reserved"] = False
         data["reserved_label"] = None
-    data["reserved_by_me"] = mine
+        data["reserved_by_me"] = False
+        data["reserved_at"] = None
+    elif not owner and not mine:
+        data["reserved_label"] = None
+    else:
+        data["reserved_by_me"] = mine
+    if reveal_reservations:
+        data["reserved_by_me"] = mine
     data["added_by_label"] = added_by_label
     data["purchased_by_label"] = purchased_by_label
+    data.setdefault("priority", item.get("priority") or "quero")
     return data
 
 
-def _present_items(items: list[dict], *, member: bool, user_id: str | None, claims: dict[str, str] | None = None) -> list[dict]:
+def _present_items(items: list[dict], *, member: bool, user_id: str | None, claims: dict[str, str] | None = None, reveal_reservations: bool = True) -> list[dict]:
     ids = [item.get("added_by") for item in items if item.get("added_by")]
     ids.extend(item.get("purchased_by") for item in items if item.get("purchased_by"))
     labels = db.labels_for_users(ids)
@@ -231,9 +268,30 @@ def _present_items(items: list[dict], *, member: bool, user_id: str | None, clai
                 mine=mine,
                 added_by_label=labels.get(item.get("added_by")),
                 purchased_by_label=labels.get(item.get("purchased_by")) if item.get("purchased") else None,
+                reveal_reservations=reveal_reservations,
             )
         )
     return presented
+
+
+def _reveal_reservations(found: dict) -> bool:
+    role = found.get("role") or "owner"
+    if role in {"owner", "editor"} and not found.get("show_reservations"):
+        return False
+    return True
+
+
+def _attach_history(items: list[dict]) -> list[dict]:
+    grouped = db.history_for_items([item["id"] for item in items if item.get("id")])
+    for item in items:
+        points = grouped.get(item["id"], [])
+        item["price_history"] = points[-24:]
+        current = item.get("price")
+        if points and current is not None and current < points[0]["price"]:
+            item["price_drop"] = round(points[0]["price"] - float(current), 2)
+        else:
+            item["price_drop"] = None
+    return items
 
 
 def _claim_matches(item: dict, token: str | None) -> bool:
@@ -419,7 +477,9 @@ def _apply_scrape(item_id: str, url: str, previous: dict | None, *, use_cache: b
                 _apply_scraped_name(changes, extracted, url, update_name=update_name)
         else:
             changes = _refresh_changes(extracted, url, previous)
-        db.update_item(item_id, changes)
+        saved = db.update_item(item_id, changes)
+        if saved and saved.get("price") is not None and ("price" in changes):
+            _note_price_change(saved)
     except Exception:
         logger.exception("scrape failed for item %s", item_id)
         failed = {
@@ -460,6 +520,39 @@ def schedule_scrape(
         daemon=True,
         name="wishly-scrape",
     ).start()
+
+
+def _note_price_change(item: dict) -> None:
+    recorded = db.record_price(item["id"], item["price"], item.get("currency"))
+    last = recorded["previous"]
+    price = float(item["price"])
+    if last is None or price > last * 0.99:
+        return
+    drop = round(last - price, 2)
+    title = "O preço caiu"
+    body = f"{item.get('name') or 'Um item'} baixou {drop:.2f}."
+    for person in db.editors_of_list(item["list_id"]):
+        db.add_notification(person["id"], "price_drop", title, body, item_id=item["id"], list_id=item["list_id"])
+        if person["email_price_alerts"]:
+            _send_price_email(person["email"], title, body)
+
+
+def _send_price_email(email: str, title: str, body: str) -> None:
+    key = (os.environ.get("RESEND_API_KEY") or "").strip()
+    sender = (os.environ.get("WISHLY_EMAIL_FROM") or "").strip()
+    if not key or not sender:
+        return
+    try:
+        import httpx
+
+        httpx.post(
+            "https://api.resend.com/emails",
+            headers={"Authorization": f"Bearer {key}"},
+            json={"from": sender, "to": [email], "subject": title, "text": body},
+            timeout=10,
+        )
+    except Exception:
+        logger.info("price email failed for %s", email)
 
 
 def _apply_scraped_name(changes: dict, extracted: Extracted, url: str, *, update_name: bool) -> None:
@@ -538,7 +631,7 @@ async def one_db_connection(request: Request, call_next):
 app.add_middleware(
     CORSMiddleware,
     allow_origins=_cors_origins(),
-    allow_origin_regex=r"https?://(localhost|127\.0\.0\.1)(:\d+)?",
+    allow_origin_regex=r"https?://(localhost|127\.0\.0\.1)(:\d+)?|chrome-extension://[\w-]+|moz-extension://[\w-]+",
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -569,6 +662,44 @@ def debug_fetch(url: str, x_wishly_debug: str | None = Header(default=None)):
         "message": result.message,
         "scrape_error": result.scrape_error,
     }
+
+
+@app.post("/api/cron/check-prices")
+def check_prices(x_cron_secret: str | None = Header(default=None), limit: int = 10):
+    secret = (os.environ.get("WISHLY_CRON_SECRET") or "").strip()
+    if not secret:
+        raise HTTPException(404, "Não encontrado.")
+    if not x_cron_secret or not hmac.compare_digest(x_cron_secret, secret):
+        raise HTTPException(401, "Segredo inválido.")
+    checked = 0
+    for item in db.items_due_for_price_check(max(1, min(limit, 25))):
+        extracted = extract_product(item["url"])
+        if extracted.price is None:
+            time.sleep(0.15)
+            continue
+        updated = db.update_item(
+            item["id"],
+            {
+                "price": extracted.price,
+                "currency": extracted.currency or item.get("currency"),
+                "status": extracted.status if extracted.status != "failed" else item.get("status") or "ok",
+                "scrape_error": (extracted.scrape_error or "")[:240] or None,
+            },
+        )
+        if updated and updated.get("price") is not None:
+            _note_price_change(updated)
+            checked += 1
+        time.sleep(0.15)
+    return {"checked": checked}
+
+
+@app.get("/api/items/{item_id}/prices")
+def item_prices(item_id: str, user: dict = Depends(current_user)):
+    _access_item(item_id, user, "viewer")
+    points = db.price_history(item_id)
+    low = min((point["price"] for point in points), default=None)
+    high = max((point["price"] for point in points), default=None)
+    return {"prices": points, "lowest": low, "highest": high}
 
 
 @app.get("/api/health")
@@ -722,7 +853,30 @@ def login(body: AuthBody, _: None = Depends(limit_auth)):
 
 @app.get("/api/auth/me")
 def me(user: dict = Depends(current_user)):
-    return user
+    stored = db.get_user(user["id"])
+    if stored is None:
+        raise HTTPException(401, "Sessão inválida. Entre de novo.")
+    return stored
+
+
+@app.patch("/api/auth/me")
+def patch_me(body: AlertSetting, user: dict = Depends(current_user)):
+    stored = db.set_email_price_alerts(user["id"], body.email_price_alerts)
+    if stored is None:
+        raise HTTPException(404, "Conta não encontrada.")
+    return stored
+
+
+@app.get("/api/notifications")
+def get_notifications(user: dict = Depends(current_user)):
+    rows = db.notifications_for(user["id"])
+    return {"notifications": rows, "unread": sum(1 for row in rows if not row["read"])}
+
+
+@app.post("/api/notifications/read", status_code=204)
+def read_notifications(user: dict = Depends(current_user)):
+    db.mark_notifications_read(user["id"])
+    return Response(status_code=204)
 
 
 @app.get("/api/lists")
@@ -898,10 +1052,38 @@ def leave_list(list_id: str, user: dict = Depends(current_user)):
     return Response(status_code=204)
 
 
+@app.patch("/api/lists/{list_id}/settings")
+def patch_list_settings(list_id: str, body: ListSettings, request: Request, user: dict = Depends(current_user)):
+    _access(list_id, user, "owner")
+    sent = body.model_fields_set
+    fields: dict = {}
+    if "reservations_enabled" in sent and body.reservations_enabled is not None:
+        fields["reservations_enabled"] = 1 if body.reservations_enabled else 0
+    if "show_reservations" in sent and body.show_reservations is not None:
+        fields["show_reservations"] = 1 if body.show_reservations else 0
+    if "budget" in sent:
+        if body.budget is not None and (body.budget < 0 or body.budget > 100_000_000):
+            raise HTTPException(400, "Informe um orçamento válido.")
+        fields["budget"] = None if body.budget is None else round(float(body.budget), 2)
+    if "budget_currency" in sent:
+        fields["budget_currency"] = _clean_currency(body.budget_currency)
+    updated = db.update_list_settings(list_id, user["id"], fields)
+    if updated is None:
+        raise HTTPException(404, "Lista não encontrada.")
+    return _present_list(updated, request)
+
+
 @app.get("/api/lists/{list_id}/items")
 def get_items(list_id: str, request: Request, user: dict = Depends(current_user)):
     found = _access(list_id, user, "viewer")
-    items = _present_items(db.list_items(list_id), member=True, user_id=user["id"])
+    items = _attach_history(
+        _present_items(
+            db.list_items(list_id),
+            member=True,
+            user_id=user["id"],
+            reveal_reservations=_reveal_reservations(found),
+        )
+    )
     totals, purchased_totals, unpriced = _split_totals(items)
     return {
         "list": _present_list(found, request),
@@ -945,6 +1127,16 @@ def reorder_categories(list_id: str, body: CategoryOrder, user: dict = Depends(c
         raise HTTPException(400, str(exc)) from exc
 
 
+@app.post("/api/lists/{list_id}/items/reorder")
+def reorder_list_items(list_id: str, body: ItemOrder, user: dict = Depends(current_user)):
+    _access(list_id, user, "editor")
+    try:
+        db.reorder_items(list_id, body.ids)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    return {"ok": True}
+
+
 @app.post("/api/lists/{list_id}/items", status_code=201)
 def create_item(list_id: str, body: ItemCreate, user: dict = Depends(current_user), _: None = Depends(limit_scrape)):
     _access(list_id, user, "editor")
@@ -964,6 +1156,8 @@ def create_item(list_id: str, body: ItemCreate, user: dict = Depends(current_use
             "store": store_name(url),
             "status": "pending",
             "message": "Lendo a página da loja…",
+            "priority": body.priority if body.priority in {"muito", "quero", "talvez"} else "quero",
+            "note": (body.note or "").strip()[:2000] or None,
         },
     )
     schedule_scrape(item["id"], url, update_name=not typed)
@@ -1009,6 +1203,21 @@ def patch_item(item_id: str, body: ItemUpdate, user: dict = Depends(current_user
         changes["currency"] = _clean_currency(body.currency)
     if "category_id" in sent:
         changes["category_id"] = _category_on_list(current["list_id"], body.category_id)
+    if "priority" in sent:
+        priority = (body.priority or "").strip().lower()
+        if priority not in {"muito", "quero", "talvez"}:
+            raise HTTPException(400, "Escolha muito quero, quero ou talvez.")
+        changes["priority"] = priority
+    if "position" in sent and body.position is not None:
+        changes["position"] = body.position
+    for key, limit in (("note", 2000), ("color", 40), ("size_label", 40), ("voltage", 20)):
+        if key in sent:
+            raw = (getattr(body, key) or "").strip()
+            changes[key] = raw[:limit] or None
+    if "quantity" in sent:
+        if body.quantity is not None and (body.quantity < 1 or body.quantity > 999):
+            raise HTTPException(400, "A quantidade precisa ficar entre 1 e 999.")
+        changes["quantity"] = body.quantity
     if "purchased" in sent:
         if body.purchased:
             changes["purchased"] = 1
@@ -1131,6 +1340,8 @@ def reserve_item(token: str, item_id: str, body: ReserveBody):
     item = next((entry for entry in found["items"] if entry["id"] == item_id), None)
     if item is None:
         raise HTTPException(404, "Item não encontrado.")
+    if not found.get("reservations_enabled", True):
+        raise HTTPException(403, "Reservas estão desligadas nesta lista.")
     if item["reserved"]:
         raise HTTPException(409, "Alguém já marcou este item.")
     label = " ".join((body.name or "").split())[:80] or None
