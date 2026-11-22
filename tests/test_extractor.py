@@ -4,12 +4,15 @@ import pytest
 
 from app.extractor import (
     PARSE_MESSAGE,
+    clean_product_title,
     extract_html,
     extract_product,
     fallback_product_name,
+    is_block_title,
     parse_price,
     product_from_kabum_catalog,
 )
+from app.fetch import fetch_via_proxy, proxy_targets
 from app.fetch import ensure_public_url
 
 FIXTURES = Path(__file__).parent / "fixtures"
@@ -270,7 +273,79 @@ def test_kabum_api_is_used_before_the_html_page(monkeypatch):
 
 
 def test_slug_becomes_a_readable_fallback_name():
-    assert fallback_product_name("https://www.kabum.com.br/produto/1071513/smart-tv-50u7066-78g-dled").startswith("Smart Tv 50u7066 78g")
+    assert (
+        fallback_product_name(
+            "https://www.kabum.com.br/produto/1071513/smart-tv-50u7066-78g-dled-50-4k-wi-fi-roku-tv-aoc"
+        )
+        == "Smart Tv 50u7066 78g Dled 50 4k Wi Fi Roku Tv Aoc"
+    )
+
+
+@pytest.mark.parametrize(
+    "title",
+    ["Access Denied", "Just a moment...", "Attention Required", "Robot Check", "403 Forbidden"],
+)
+def test_block_titles_are_discarded(title):
+    assert is_block_title(title)
+    assert clean_product_title(title) == ""
+    html = f"<html><head><title>{title}</title></head><body>{title}</body></html>"
+    result = extract_html(
+        html,
+        "https://www.kabum.com.br/produto/1071513/smart-tv-50u7066-78g-dled-50-4k-wi-fi-roku-tv-aoc",
+        status=403,
+    )
+    assert result.title is None
+    assert result.status == "failed"
+
+
+def test_proxy_stays_off_until_configured(monkeypatch):
+    monkeypatch.delenv("WISHLY_FETCH_PROXY_URL", raising=False)
+    monkeypatch.delenv("SCRAPER_API_KEY", raising=False)
+    assert proxy_targets("https://www.kabum.com.br/produto/1") == []
+    assert fetch_via_proxy("https://www.kabum.com.br/produto/1") is None
+
+
+def test_proxy_targets_worker_then_scraperapi(monkeypatch):
+    monkeypatch.setenv("WISHLY_FETCH_PROXY_URL", "https://wishly.example.workers.dev")
+    monkeypatch.setenv("WISHLY_PROXY_SECRET", "segredo")
+    monkeypatch.setenv("SCRAPER_API_KEY", "chave")
+    targets = proxy_targets("https://www.kabum.com.br/produto/1")
+    assert targets[0][0] == "https://wishly.example.workers.dev"
+    assert targets[0][1]["url"].startswith("https://www.kabum.com.br/")
+    assert targets[0][2]["WISHLY_PROXY_SECRET"] == "segredo"
+    assert targets[1][0] == "https://api.scraperapi.com/"
+    assert targets[1][1]["api_key"] == "chave"
+
+
+def test_blocked_page_retries_through_the_proxy_when_configured(monkeypatch):
+    monkeypatch.setenv("WISHLY_FETCH_PROXY_URL", "https://wishly.example.workers.dev")
+    monkeypatch.setattr("app.extractor.fetch_kabum_product", lambda url: (None, "kabum-api products http=403"))
+    monkeypatch.setattr(
+        "app.extractor.fetch_html",
+        lambda url, timeout=10: __import__("app.fetch", fromlist=["FetchResult"]).FetchResult(
+            True, url, url, 403, "<html><title>Access Denied</title></html>", None, "curl_cffi"
+        ),
+    )
+    calls = {"n": 0}
+
+    def proxy(url, timeout=20):
+        calls["n"] += 1
+        from app.fetch import FetchResult
+
+        page = """<html><head>
+          <title>Smart Tv 50u7066</title>
+          <meta property="product:price:amount" content="1788.80">
+          <meta property="product:price:currency" content="BRL">
+          <meta property="og:image" content="https://images.kabum.com.br/tv.jpg">
+        </head></html>"""
+        return FetchResult(True, url, url, 200, page, None, "proxy")
+
+    monkeypatch.setattr("app.fetch.fetch_via_proxy", proxy)
+    result = extract_product("https://www.kabum.com.br/produto/1071513/smart-tv-50u7066-78g")
+    assert calls["n"] == 1
+    assert result.price == 1788.80
+    assert result.title == "Smart Tv 50u7066"
+    assert "via-proxy" in (result.scrape_error or "")
 
 
 def test_private_urls_are_rejected():

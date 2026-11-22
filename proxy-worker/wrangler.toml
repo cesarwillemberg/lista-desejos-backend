@@ -1,0 +1,6 @@
+name = "wishly-fetch-proxy"
+main = "worker.js"
+compatibility_date = "2026-11-22"
+
+# O segredo não fica neste arquivo.
+# Depois do deploy: npx wrangler secret put WISHLY_PROXY_SECRET

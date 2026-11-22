@@ -27,7 +27,7 @@ from starlette.requests import Request
 
 from app import db
 from app.auth import current_user, hash_password, issue_token, jwt_secret, password_needs_rehash, verify_password
-from app.extractor import PENDING_NAME, Extracted, extract_product, fallback_product_name, store_name
+from app.extractor import PENDING_NAME, Extracted, extract_product, fallback_product_name, is_block_title, store_name
 from app.fetch import ensure_public_url, fetch_image
 from app.limit import limit_auth, limit_scrape
 from app.share_codes import new_short_code
@@ -404,6 +404,8 @@ def _refresh_changes(extracted: Extracted, url: str, previous: dict) -> dict:
         changes["status"] = "partial"
         changes["message"] = "Atualizamos o preço, mas a foto continua indisponível."
     changes["scrape_error"] = (extracted.scrape_error or "")[:240] or None
+    if is_block_title(previous.get("name")) or previous.get("name") == PENDING_NAME:
+        _apply_scraped_name(changes, extracted, url, update_name=True)
     return changes
 
 
@@ -464,7 +466,10 @@ def _apply_scraped_name(changes: dict, extracted: Extracted, url: str, *, update
     if not update_name:
         return
     title = (extracted.title or "").strip()
-    changes["name"] = title[:160] if title else fallback_product_name(url)
+    if extracted.status == "failed" or not title or is_block_title(title):
+        changes["name"] = fallback_product_name(url)
+        return
+    changes["name"] = title[:160]
 
 
 def _enable_info_logs() -> None:

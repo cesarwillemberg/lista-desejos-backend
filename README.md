@@ -39,6 +39,9 @@ export JWT_SECRET=dev-only-change-me-please
 | `WISHLY_DB_POOL_MAX` | `6` | Postgres pool size. A Neon `-pooler` host in `DATABASE_URL` is used as-is; prepared statements stay off so transaction-mode pooling works |
 | `WISHLY_MIGRATE` | `1` | `0` skips `alembic upgrade` on startup. Leave it on unless the Render pre-deploy command runs the upgrade |
 | `WISHLY_SCRAPE_INLINE` | unset | `1` runs the product fetch in the request. Tests set this. Production fills the photo and price in a background thread |
+| `WISHLY_FETCH_PROXY_URL` | unset | Optional. A Cloudflare Worker that accepts `?url=`. Used only after a direct fetch is blocked. See `proxy-worker/README.md` |
+| `WISHLY_PROXY_SECRET` | unset | Sent as the `WISHLY_PROXY_SECRET` header when the Worker URL is set |
+| `SCRAPER_API_KEY` | unset | Optional ScraperAPI key, also used only after a direct fetch is blocked |
 
 ```bash
 pytest

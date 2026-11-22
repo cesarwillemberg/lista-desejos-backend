@@ -10,6 +10,7 @@ from __future__ import annotations
 import gzip
 import ipaddress
 import logging
+import os
 import socket
 import zlib
 from dataclasses import dataclass
@@ -145,6 +146,45 @@ def fetch_html(url: str, timeout: float = 10.0) -> FetchResult:
     if secondary is not None:
         return _log_fetch(url, secondary)
     return _log_fetch(url, FetchResult(False, url, url, None, "", "Não foi possível acessar a página da loja.", None))
+
+
+def proxy_configured() -> bool:
+    return bool((os.environ.get("WISHLY_FETCH_PROXY_URL") or "").strip() or (os.environ.get("SCRAPER_API_KEY") or "").strip())
+
+
+def proxy_targets(url: str) -> list[tuple[str, dict[str, str], dict[str, str]]]:
+    """Request specs for the optional proxy. Empty unless an env var is set."""
+    targets: list[tuple[str, dict[str, str], dict[str, str]]] = []
+    worker = (os.environ.get("WISHLY_FETCH_PROXY_URL") or "").strip()
+    if worker:
+        secret = (os.environ.get("WISHLY_PROXY_SECRET") or "").strip()
+        headers = {"WISHLY_PROXY_SECRET": secret} if secret else {}
+        targets.append((worker, {"url": url}, headers))
+    key = (os.environ.get("SCRAPER_API_KEY") or "").strip()
+    if key:
+        targets.append(("https://api.scraperapi.com/", {"api_key": key, "url": url, "country_code": "br"}, {}))
+    return targets
+
+
+def fetch_via_proxy(url: str, timeout: float = 20.0) -> FetchResult | None:
+    """Fetch through a Worker or ScraperAPI. Does nothing when both env vars are unset."""
+    targets = proxy_targets(url)
+    if not targets:
+        return None
+    last: FetchResult | None = None
+    for endpoint, params, headers in targets:
+        try:
+            with httpx.Client(follow_redirects=True, timeout=timeout, headers=headers) as client:
+                response = client.get(endpoint, params=params)
+        except Exception as exc:
+            logger.info("proxy failed endpoint=%s err=%s", endpoint, exc)
+            continue
+        via = "proxy" if "scraperapi.com" not in endpoint else "scraperapi"
+        last = _result_from_response(url, str(response.url), response.status_code, response.headers, response.content, via)
+        logger.info("proxy status=%s via=%s len=%s endpoint=%s", last.status, via, len(last.html or ""), endpoint)
+        if last.status and last.status < 400 and len(last.html or "") > 800:
+            return last
+    return last
 
 
 def fetch_image(url: str, referer: str | None, timeout: float = 15.0) -> tuple[bytes, str]:

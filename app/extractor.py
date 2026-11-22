@@ -108,6 +108,17 @@ def extract_product(url: str) -> Extracted:
         result = api_product
     elif api_note and result.price is None:
         result.scrape_error = f"{result.scrape_error}; {api_note}"[:240]
+    if (result.scrape_error or "").startswith("blocked"):
+        from app.fetch import fetch_via_proxy
+
+        proxied = fetch_via_proxy(url)
+        if proxied is not None and proxied.html:
+            parsed = _from_fetch(proxied)
+            parsed.scrape_error = f"{parsed.scrape_error}; via-proxy"[:240]
+            if parsed.price is not None or not (parsed.scrape_error or "").startswith("blocked"):
+                result = parsed
+            else:
+                result.scrape_error = f"{result.scrape_error}; proxy-still-blocked"[:240]
     logger.info(
         "scrape url=%s http=%s via=%s final=%s len=%s price=%s image=%s err=%s",
         url,
@@ -213,12 +224,38 @@ def currency_from_text(value: str | None) -> str | None:
     return None
 
 
+_BLOCK_TITLE_MARKERS = (
+    "access denied",
+    "just a moment",
+    "attention required",
+    "robot check",
+    "403 forbidden",
+    "401 unauthorized",
+    "429 too many",
+    "pardon our interruption",
+    "não é possível acessar",
+    "nao e possivel acessar",
+    "forbidden",
+)
+
+
+def is_block_title(value: str | None) -> bool:
+    text = " ".join((value or "").split()).lower().strip(" .!…")
+    if not text:
+        return False
+    return any(text == marker or text.startswith(marker) for marker in _BLOCK_TITLE_MARKERS)
+
+
 def clean_product_title(value: str) -> str:
     text = " ".join((value or "").split())
+    if is_block_title(text):
+        return ""
     previous = None
     while text and text != previous:
         previous = text
         text = _STORE_SUFFIX.sub("", text).strip(" |-–—")
+    if is_block_title(text):
+        return ""
     return text[:160]
 
 
@@ -462,6 +499,8 @@ def _finish(draft: _Draft, fetched: FetchResult, soup: BeautifulSoup) -> Extract
         message = None
         status = "ok"
         kind, reason = "ok", draft.price_source or "parsed"
+    if status == "failed":
+        draft.title = None
     return Extracted(
         image_url=draft.image,
         price=round(draft.price, 2) if draft.price is not None else None,

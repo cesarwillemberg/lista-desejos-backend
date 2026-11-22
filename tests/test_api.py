@@ -653,6 +653,57 @@ def test_blank_name_uses_the_page_title_and_a_typed_name_stays(client, monkeypat
     assert _saved(client, headers, list_id, typed.json()["id"])["name"] == "Minha TV"
 
 
+def test_block_page_title_is_replaced_by_the_slug(client, monkeypatch):
+    monkeypatch.setattr(
+        "app.main.extract_product",
+        lambda url: Extracted(
+            title="Access Denied",
+            status="failed",
+            message="Essa loja bloqueia a busca automática; edite o preço manualmente",
+            http_status=403,
+            scrape_error="blocked reason=http-403 http=403 via=curl_cffi len=491",
+            final_url=url,
+        ),
+    )
+    headers, _user = _auth(client, "bloqueio@example.com")
+    list_id = client.get("/api/lists", headers=headers).json()["lists"][0]["id"]
+    created = client.post(
+        f"/api/lists/{list_id}/items",
+        json={"url": "https://www.kabum.com.br/produto/1071513/smart-tv-50u7066-78g-dled-50-4k-wi-fi-roku-tv-aoc"},
+        headers=headers,
+    )
+    saved = _saved(client, headers, list_id, created.json()["id"])
+    assert saved["name"] == "Smart Tv 50u7066 78g Dled 50 4k Wi Fi Roku Tv Aoc"
+    assert saved["message"].startswith("Essa loja bloqueia")
+
+
+def test_refresh_renames_an_access_denied_item(client, monkeypatch):
+    monkeypatch.setattr(
+        "app.main.extract_product",
+        lambda url: Extracted(
+            status="failed",
+            message="Essa loja bloqueia a busca automática; edite o preço manualmente",
+            http_status=403,
+            scrape_error="blocked reason=http-403",
+            final_url=url,
+        ),
+    )
+    headers, _user = _auth(client, "renomear@example.com")
+    list_id = client.get("/api/lists", headers=headers).json()["lists"][0]["id"]
+    created = client.post(
+        f"/api/lists/{list_id}/items",
+        json={
+            "name": "Access Denied",
+            "url": "https://www.kabum.com.br/produto/1071513/smart-tv-50u7066-78g-dled-50-4k-wi-fi-roku-tv-aoc",
+        },
+        headers=headers,
+    )
+    item_id = created.json()["id"]
+    refreshed = client.post(f"/api/items/{item_id}/refresh", headers=headers)
+    assert refreshed.status_code == 200
+    assert _saved(client, headers, list_id, item_id)["name"] == "Smart Tv 50u7066 78g Dled 50 4k Wi Fi Roku Tv Aoc"
+
+
 def test_failed_scrape_names_the_item_from_the_slug(client, monkeypatch):
     monkeypatch.setattr(
         "app.main.extract_product",
