@@ -41,11 +41,12 @@ def password_needs_rehash(password_hash: str) -> bool:
     return _hasher.check_needs_rehash(password_hash)
 
 
-def issue_token(user_id: str, email: str) -> str:
+def issue_token(user_id: str, email: str, token_version: int = 0) -> str:
     now = datetime.now(timezone.utc)
     payload = {
         "sub": user_id,
         "email": email,
+        "tv": int(token_version),
         "iat": int(now.timestamp()),
         "exp": int((now + timedelta(days=_TOKEN_DAYS)).timestamp()),
     }
@@ -61,12 +62,16 @@ def current_user(authorization: str | None = Header(default=None)) -> dict:
     except jwt.PyJWTError as exc:
         raise HTTPException(401, "Sessão inválida. Entre de novo.") from exc
     user_id = payload.get("sub")
-    email = payload.get("email")
     if not isinstance(user_id, str):
         raise HTTPException(401, "Sessão inválida. Entre de novo.")
-    if isinstance(email, str) and email:
-        return {"id": user_id, "email": email}
     user = db.get_user(user_id)
     if user is None:
+        raise HTTPException(401, "Sessão inválida. Entre de novo.")
+    claimed = payload.get("tv", 0)
+    try:
+        claimed = int(claimed)
+    except (TypeError, ValueError):
+        claimed = 0
+    if claimed != int(user.get("token_version") or 0):
         raise HTTPException(401, "Sessão inválida. Entre de novo.")
     return user

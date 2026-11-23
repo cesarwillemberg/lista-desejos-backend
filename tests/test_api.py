@@ -249,7 +249,20 @@ def test_refresh_keeps_previous_when_fetch_fails(client, monkeypatch):
     assert refreshed.json()["status"] == "pending"
     settled = _saved(client, headers, list_id, item["id"])
     assert settled["price"] == 6196.39
-    assert "Mantivemos" in settled["message"]
+    assert settled["status"] == "failed"
+    assert "Mantivemos" not in (settled["message"] or "")
+    assert settled["message"] == "Não consegui atualizar agora. Edite o preço ou toque em Tentar de novo."
+    monkeypatch.setattr(
+        "app.main.extract_product",
+        lambda url: Extracted(status="failed", message="Essa loja bloqueia a busca automática; edite o preço manualmente", scrape_error="blocked", final_url=url),
+    )
+    blocked = client.post(f"/api/items/{item['id']}/refresh", headers=headers)
+    assert blocked.status_code == 200
+    kept = _saved(client, headers, list_id, item["id"])
+    assert kept["price"] == 6196.39
+    assert kept["status"] == "failed"
+    assert kept["message"] == "A loja bloqueou a busca automática. Edite o preço ou toque em Tentar de novo."
+    assert "Mantivemos" not in kept["message"]
 
 
 def test_rate_limit_blocks_repeated_login(client):
@@ -831,6 +844,32 @@ def test_notes_details_and_manual_order(client, monkeypatch):
     assert by_id[second]["position"] < by_id[first]["position"]
     assert by_id[second]["note"] == "rascunho"
     assert by_id[second]["priority"] == "talvez"
+    again = client.get(f"/api/lists/{list_id}/items", headers=headers).json()["items"]
+    again_by_id = {item["id"]: item for item in again}
+    assert again_by_id[second]["position"] < again_by_id[first]["position"]
+    kitchen = client.post(f"/api/lists/{list_id}/categories", json={"name": "Cozinha"}, headers=headers)
+    assert kitchen.status_code == 201
+    kitchen_id = kitchen.json()["id"]
+    placed = []
+    for name in ("panela", "copo", "prato"):
+        created = client.post(
+            f"/api/lists/{list_id}/items",
+            json={"name": name, "url": f"https://www.kabum.com.br/produto/{name}", "category_id": kitchen_id},
+            headers=headers,
+        )
+        assert created.status_code == 201, created.text
+        placed.append(created.json()["id"])
+    everyone = client.get(f"/api/lists/{list_id}/items", headers=headers).json()["items"]
+    ids = [item["id"] for item in sorted(everyone, key=lambda item: item["position"])]
+    moved = [placed[2], placed[0], placed[1]] + [item_id for item_id in ids if item_id not in placed]
+    saved = client.post(f"/api/lists/{list_id}/items/reorder", json={"ids": moved}, headers=headers)
+    assert saved.status_code == 200, saved.text
+    persisted = client.get(f"/api/lists/{list_id}/items", headers=headers).json()["items"]
+    order = [item["id"] for item in sorted(persisted, key=lambda item: (item["position"], item["created_at"]))]
+    assert order == moved
+    kitchen_items = [item for item in persisted if item["category_id"] == kitchen_id]
+    kitchen_items.sort(key=lambda item: item["position"])
+    assert [item["id"] for item in kitchen_items] == [placed[2], placed[0], placed[1]]
 
 
 def test_create_keeps_typed_price_and_details(client, monkeypatch):
@@ -935,3 +974,68 @@ def test_login_rehashes_an_old_password(client):
 
     assert password_needs_rehash(stored["password_hash"]) is False
     assert client.get("/api/auth/me", headers=headers).status_code == 200
+
+
+def test_profile_name_email_password_and_avatar(client, monkeypatch):
+    monkeypatch.setattr("app.main.extract_product", lambda url: Extracted(status="failed", final_url=url))
+    headers, user = _auth(client, "perfil@example.com")
+    renamed = client.patch("/api/me", json={"display_name": "Ana Souza"}, headers=headers)
+    assert renamed.status_code == 200, renamed.text
+    assert renamed.json()["display_name"] == "Ana Souza"
+    assert "token_version" not in renamed.json()
+    list_id = client.get("/api/lists", headers=headers).json()["lists"][0]["id"]
+    members = client.get(f"/api/lists/{list_id}/members", headers=headers).json()["members"]
+    assert members[0]["label"] == "Ana Souza"
+    created = client.post(
+        f"/api/lists/{list_id}/items",
+        json={"name": "Copo", "url": "https://www.kabum.com.br/produto/1/copo"},
+        headers=headers,
+    )
+    assert created.json()["added_by_label"] == "Ana Souza"
+    reserved = client.post(f"/api/items/{created.json()['id']}/reservation", json={}, headers=headers)
+    assert reserved.status_code == 200
+    assert reserved.json()["reserved_label"] == "Ana Souza"
+
+    clash = client.post("/api/auth/register", json={"email": "outra@example.com", "password": "senha-forte"})
+    assert clash.status_code == 201
+    taken = client.post("/api/me/email", json={"email": "outra@example.com", "password": "errada"}, headers=headers)
+    assert taken.status_code == 401
+    taken = client.post("/api/me/email", json={"email": "outra@example.com", "password": "senha-forte"}, headers=headers)
+    assert taken.status_code == 409
+    moved = client.post("/api/me/email", json={"email": "ana.nova@example.com", "password": "senha-forte"}, headers=headers)
+    assert moved.status_code == 200, moved.text
+    headers = {"Authorization": f"Bearer {moved.json()['token']}"}
+    assert moved.json()["user"]["email"] == "ana.nova@example.com"
+
+    same = client.post(
+        "/api/me/password",
+        json={"current_password": "senha-forte", "new_password": "curta"},
+        headers=headers,
+    )
+    assert same.status_code == 400
+    changed = client.post(
+        "/api/me/password",
+        json={"current_password": "senha-forte", "new_password": "senha-nova-1"},
+        headers=headers,
+    )
+    assert changed.status_code == 200, changed.text
+    assert client.get("/api/me", headers=headers).status_code == 401
+    headers = {"Authorization": f"Bearer {changed.json()['token']}"}
+    assert client.get("/api/me", headers=headers).status_code == 200
+
+    junk = client.put("/api/me/avatar", content=b"not-an-image", headers={**headers, "content-type": "image/jpeg"})
+    assert junk.status_code == 400
+    jpeg = b"\xff\xd8\xff\xe0" + b"\x00" * 32
+    saved = client.put("/api/me/avatar", content=jpeg, headers={**headers, "content-type": "image/jpeg"})
+    assert saved.status_code == 200, saved.text
+    assert saved.json()["has_avatar"] is True
+    photo = client.get(f"/api/users/{user['id']}/avatar")
+    assert photo.status_code == 200
+    assert photo.content == jpeg
+    assert photo.headers["etag"]
+    cached = client.get(f"/api/users/{user['id']}/avatar", headers={"If-None-Match": photo.headers["etag"]})
+    assert cached.status_code == 304
+    removed = client.delete("/api/me/avatar", headers=headers)
+    assert removed.status_code == 200
+    assert removed.json()["has_avatar"] is False
+    assert client.get(f"/api/users/{user['id']}/avatar").status_code == 404

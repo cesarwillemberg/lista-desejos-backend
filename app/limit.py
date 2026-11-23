@@ -47,6 +47,7 @@ def _limit_from_env(name: str, default: int) -> int:
 
 auth_limiter = RateLimiter(_limit_from_env("WISHLY_AUTH_RATE", 20))
 scrape_limiter = RateLimiter(_limit_from_env("WISHLY_SCRAPE_RATE", 30))
+account_limiter = RateLimiter(_limit_from_env("WISHLY_ACCOUNT_RATE", 10))
 
 
 def _client_key(request: Request, bucket: str) -> str:
@@ -57,6 +58,11 @@ def _client_key(request: Request, bucket: str) -> str:
 def limit_auth(request: Request) -> None:
     if not auth_limiter.allow(_client_key(request, "auth")):
         raise HTTPException(429, "Muitas tentativas de entrar. Espere um minuto e tente de novo.")
+
+
+def limit_account(request: Request) -> None:
+    if not account_limiter.allow(_client_key(request, "account")):
+        raise HTTPException(429, "Muitas alterações na conta. Espere um minuto e tente de novo.")
 
 
 def limit_scrape(request: Request) -> None:

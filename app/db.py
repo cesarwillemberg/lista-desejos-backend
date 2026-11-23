@@ -334,7 +334,30 @@ def _count(row) -> int:
 def row_to_user(row) -> dict:
     keys = row.keys()
     alerts = row["email_price_alerts"] if "email_price_alerts" in keys else 1
-    return {"id": row["id"], "email": row["email"], "created_at": row["created_at"], "email_price_alerts": bool(alerts)}
+    display = row["display_name"] if "display_name" in keys else None
+    if isinstance(display, str):
+        display = display.strip() or None
+    version = int(row["token_version"]) if "token_version" in keys and row["token_version"] is not None else 0
+    avatar_at = row["avatar_at"] if "avatar_at" in keys else None
+    return {
+        "id": row["id"],
+        "email": row["email"],
+        "created_at": row["created_at"],
+        "email_price_alerts": bool(alerts),
+        "display_name": display,
+        "token_version": version,
+        "has_avatar": bool(avatar_at),
+        "avatar_at": avatar_at,
+    }
+
+
+_USER_SQL = """
+SELECT users.id, users.email, users.password_hash, users.created_at,
+       users.display_name, users.token_version, users.email_price_alerts,
+       avatars.updated_at AS avatar_at
+FROM users
+LEFT JOIN user_avatars AS avatars ON avatars.user_id = users.id
+"""
 
 
 def money_totals(items: list[dict]) -> list[dict]:
@@ -406,14 +429,22 @@ def row_to_item(row) -> dict:
     }
 
 
-def person_label(email: str | None) -> str:
+def person_label(email: str | None, display_name: str | None = None) -> str:
+    if isinstance(display_name, str) and display_name.strip():
+        return display_name.strip()
     if not email or "@" not in email:
         return "alguém"
     name = email.split("@", 1)[0].replace(".", " ").replace("_", " ").strip()
     return name[:1].upper() + name[1:] if name else "alguém"
 
 
-def person_initials(email: str | None) -> str:
+def person_initials(email: str | None, display_name: str | None = None) -> str:
+    if isinstance(display_name, str) and display_name.strip():
+        parts = [part for part in display_name.replace("-", " ").split() if part]
+        if len(parts) >= 2:
+            return (parts[0][0] + parts[1][0]).upper()
+        cleaned = "".join(char for char in display_name if char.isalnum())
+        return (cleaned[:2] or "?").upper()
     if not email or "@" not in email:
         return "?"
     local = email.split("@", 1)[0]
@@ -426,21 +457,28 @@ def person_initials(email: str | None) -> str:
 
 def _member_from_row(row) -> dict:
     email = row["email"]
+    keys = row.keys()
+    display = row["display_name"] if "display_name" in keys else None
+    avatar_at = row["avatar_at"] if "avatar_at" in keys else None
     return {
         "user_id": row["user_id"],
         "email": email,
-        "label": person_label(email),
-        "initials": person_initials(email),
+        "label": person_label(email, display),
+        "initials": person_initials(email, display),
         "role": row["role"],
+        "has_avatar": bool(avatar_at),
+        "avatar_at": avatar_at,
     }
 
 
 def _member_rows(conn: _Conn, list_id: str) -> list[dict]:
     rows = conn.execute(
         """
-        SELECT list_members.user_id, list_members.role, users.email
+        SELECT list_members.user_id, list_members.role, users.email, users.display_name,
+               avatars.updated_at AS avatar_at
         FROM list_members
         JOIN users ON users.id = list_members.user_id
+        LEFT JOIN user_avatars AS avatars ON avatars.user_id = users.id
         WHERE list_members.list_id = ?
         ORDER BY CASE list_members.role WHEN 'owner' THEN 0 WHEN 'editor' THEN 1 ELSE 2 END, users.email
         """,
@@ -464,7 +502,7 @@ def public_item(item: dict, *, mine: bool) -> dict:
 
 def get_user(user_id: str) -> dict | None:
     with connect() as conn:
-        row = conn.execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone()
+        row = conn.execute(_USER_SQL + " WHERE users.id = ?", (user_id,)).fetchone()
     return row_to_user(row) if row else None
 
 
@@ -473,9 +511,69 @@ def set_password_hash(user_id: str, password_hash: str) -> None:
         conn.execute("UPDATE users SET password_hash = ? WHERE id = ?", (password_hash, user_id))
 
 
+def replace_password(user_id: str, password_hash: str) -> dict | None:
+    with connect() as conn:
+        conn.execute(
+            "UPDATE users SET password_hash = ?, token_version = COALESCE(token_version, 0) + 1 WHERE id = ?",
+            (password_hash, user_id),
+        )
+    return get_user(user_id)
+
+
+def set_display_name(user_id: str, display_name: str | None) -> dict | None:
+    with connect() as conn:
+        conn.execute("UPDATE users SET display_name = ? WHERE id = ?", (display_name, user_id))
+    return get_user(user_id)
+
+
+def set_user_email(user_id: str, email: str) -> dict | None:
+    with connect() as conn:
+        taken = conn.execute("SELECT id FROM users WHERE email = ? AND id != ?", (email, user_id)).fetchone()
+        if taken is not None:
+            raise ValueError("Este e-mail já tem uma conta.")
+        conn.execute("UPDATE users SET email = ? WHERE id = ?", (email, user_id))
+    return get_user(user_id)
+
+
+def save_avatar(user_id: str, content: bytes, media_type: str) -> dict | None:
+    now = utc_now()
+    with connect() as conn:
+        conn.execute(
+            """
+            INSERT INTO user_avatars (user_id, content, media_type, updated_at)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(user_id) DO UPDATE SET
+              content = excluded.content,
+              media_type = excluded.media_type,
+              updated_at = excluded.updated_at
+            """,
+            (user_id, content, media_type, now),
+        )
+    return get_user(user_id)
+
+
+def delete_avatar(user_id: str) -> None:
+    with connect() as conn:
+        conn.execute("DELETE FROM user_avatars WHERE user_id = ?", (user_id,))
+
+
+def get_avatar(user_id: str) -> dict | None:
+    with connect() as conn:
+        row = conn.execute(
+            "SELECT content, media_type, updated_at FROM user_avatars WHERE user_id = ?",
+            (user_id,),
+        ).fetchone()
+    if row is None:
+        return None
+    content = row["content"]
+    if not isinstance(content, bytes):
+        content = bytes(content)
+    return {"content": content, "media_type": row["media_type"], "updated_at": row["updated_at"]}
+
+
 def get_user_by_email(email: str) -> dict | None:
     with connect() as conn:
-        row = conn.execute("SELECT id, email, password_hash, created_at FROM users WHERE email = ?", (email,)).fetchone()
+        row = conn.execute(_USER_SQL + " WHERE users.email = ?", (email,)).fetchone()
     if row is None:
         return None
     user = row_to_user(row)
@@ -1001,14 +1099,33 @@ def reorder_categories(list_id: str, ids: list[str]) -> list[dict]:
     return list_categories(list_id)
 
 
-def labels_for_users(user_ids: list[str]) -> dict[str, str]:
+def profiles_for_users(user_ids: list[str]) -> dict[str, dict]:
     unique = [user_id for user_id in dict.fromkeys(user_ids) if user_id]
     if not unique:
         return {}
     marks = ", ".join("?" for _ in unique)
     with connect() as conn:
-        rows = conn.execute(f"SELECT id, email FROM users WHERE id IN ({marks})", tuple(unique)).fetchall()
-    return {row["id"]: person_label(row["email"]) for row in rows}
+        rows = conn.execute(
+            f"""
+            SELECT users.id, users.email, users.display_name, avatars.updated_at AS avatar_at
+            FROM users
+            LEFT JOIN user_avatars AS avatars ON avatars.user_id = users.id
+            WHERE users.id IN ({marks})
+            """,
+            tuple(unique),
+        ).fetchall()
+    return {
+        row["id"]: {
+            "label": person_label(row["email"], row["display_name"]),
+            "has_avatar": bool(row["avatar_at"]),
+            "avatar_at": row["avatar_at"],
+        }
+        for row in rows
+    }
+
+
+def labels_for_users(user_ids: list[str]) -> dict[str, str]:
+    return {user_id: profile["label"] for user_id, profile in profiles_for_users(user_ids).items()}
 
 
 def list_members(list_id: str) -> list[dict]:

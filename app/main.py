@@ -29,7 +29,7 @@ from app import db
 from app.auth import current_user, hash_password, issue_token, jwt_secret, password_needs_rehash, verify_password
 from app.extractor import PENDING_NAME, Extracted, extract_product, fallback_product_name, is_block_title, store_name
 from app.fetch import ensure_public_url, fetch_image
-from app.limit import limit_auth, limit_scrape
+from app.limit import limit_account, limit_auth, limit_scrape
 from app.share_codes import new_short_code
 
 logger = logging.getLogger("wishly.api")
@@ -119,6 +119,24 @@ class ListSettings(BaseModel):
 class AlertSetting(BaseModel):
     model_config = ConfigDict(extra="ignore")
     email_price_alerts: bool
+
+
+class ProfileBody(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+    display_name: str | None = None
+    email_price_alerts: bool | None = None
+
+
+class EmailChange(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+    email: str
+    password: str
+
+
+class PasswordChange(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+    current_password: str
+    new_password: str
 
 
 class MemberBody(BaseModel):
@@ -237,6 +255,12 @@ def _present_item(
     added_by_label: str | None = None,
     purchased_by_label: str | None = None,
     reveal_reservations: bool = True,
+    added_by_id: str | None = None,
+    added_by_has_avatar: bool = False,
+    added_by_avatar_at: str | None = None,
+    reserved_by_id: str | None = None,
+    reserved_by_has_avatar: bool = False,
+    reserved_by_avatar_at: str | None = None,
 ) -> dict:
     hidden = {"reserved_token_hash", "added_by", "reserved_by", "purchased_by"}
     if not owner:
@@ -255,6 +279,16 @@ def _present_item(
         data["reserved_by_me"] = mine
     data["added_by_label"] = added_by_label
     data["purchased_by_label"] = purchased_by_label
+    if added_by_id:
+        data["added_by_id"] = added_by_id
+        data["added_by_has_avatar"] = added_by_has_avatar
+        if added_by_avatar_at:
+            data["added_by_avatar_at"] = added_by_avatar_at
+    if reserved_by_id and reveal_reservations and (owner or mine):
+        data["reserved_by_id"] = reserved_by_id
+        data["reserved_by_has_avatar"] = reserved_by_has_avatar
+        if reserved_by_avatar_at:
+            data["reserved_by_avatar_at"] = reserved_by_avatar_at
     data.setdefault("priority", item.get("priority") or "quero")
     return data
 
@@ -262,20 +296,29 @@ def _present_item(
 def _present_items(items: list[dict], *, member: bool, user_id: str | None, claims: dict[str, str] | None = None, reveal_reservations: bool = True) -> list[dict]:
     ids = [item.get("added_by") for item in items if item.get("added_by")]
     ids.extend(item.get("purchased_by") for item in items if item.get("purchased_by"))
-    labels = db.labels_for_users(ids)
+    profiles = db.profiles_for_users(ids)
     presented = []
     for item in items:
         mine = bool(user_id and item.get("reserved_by") == user_id)
         if not mine and claims is not None:
             mine = _claim_matches(item, claims.get(item["id"]))
+        added = profiles.get(item.get("added_by")) or {}
+        bought = profiles.get(item.get("purchased_by")) or {}
+        reserved = profiles.get(item.get("reserved_by")) or {}
         presented.append(
             _present_item(
                 item,
                 owner=member,
                 mine=mine,
-                added_by_label=labels.get(item.get("added_by")),
-                purchased_by_label=labels.get(item.get("purchased_by")) if item.get("purchased") else None,
+                added_by_label=added.get("label"),
+                purchased_by_label=bought.get("label") if item.get("purchased") else None,
                 reveal_reservations=reveal_reservations,
+                added_by_id=item.get("added_by") if member else None,
+                added_by_has_avatar=bool(added.get("has_avatar")) if member else False,
+                added_by_avatar_at=added.get("avatar_at") if member else None,
+                reserved_by_id=item.get("reserved_by") if member and reveal_reservations else None,
+                reserved_by_has_avatar=bool(reserved.get("has_avatar")),
+                reserved_by_avatar_at=reserved.get("avatar_at"),
             )
         )
     return presented
@@ -324,8 +367,23 @@ def _claims(header: str | None) -> dict[str, str]:
     return found
 
 
+def _public_user(user: dict) -> dict:
+    return {
+        "id": user["id"],
+        "email": user["email"],
+        "created_at": user.get("created_at"),
+        "email_price_alerts": bool(user.get("email_price_alerts", True)),
+        "display_name": user.get("display_name"),
+        "has_avatar": bool(user.get("has_avatar")),
+        "avatar_at": user.get("avatar_at"),
+    }
+
+
 def _auth_payload(user: dict) -> dict:
-    return {"token": issue_token(user["id"], user["email"]), "user": user}
+    return {
+        "token": issue_token(user["id"], user["email"], user.get("token_version") or 0),
+        "user": _public_user(user),
+    }
 
 
 _ROLE_RANK = {"viewer": 1, "editor": 2, "owner": 3}
@@ -443,6 +501,13 @@ def _replace_changes(extracted: Extracted, url: str, *, update_name: bool) -> di
     return changes
 
 
+def _kept_refresh_message(extracted: Extracted) -> str:
+    note = f"{extracted.message or ''} {extracted.scrape_error or ''}".lower()
+    if "bloque" in note or (extracted.scrape_error or "").startswith("blocked"):
+        return "A loja bloqueou a busca automática. Edite o preço ou toque em Tentar de novo."
+    return "Não consegui atualizar agora. Edite o preço ou toque em Tentar de novo."
+
+
 def _refresh_changes(extracted: Extracted, url: str, previous: dict) -> dict:
     changes: dict = {"store": store_name(url)}
     if extracted.image_url:
@@ -455,10 +520,8 @@ def _refresh_changes(extracted: Extracted, url: str, previous: dict) -> dict:
     image = changes.get("image_url", previous.get("image_url"))
     price = changes.get("price", previous.get("price"))
     if extracted.image_url is None and extracted.price is None:
-        kept = "Mantivemos a foto e o preço que já estavam salvos."
-        detail = extracted.message or "Não foi possível ler a página agora."
-        changes["message"] = f"{detail} {kept}"
-        changes["status"] = previous.get("status") if previous.get("status") not in {None, "pending"} else "failed"
+        changes["message"] = _kept_refresh_message(extracted)
+        changes["status"] = "failed"
     elif image and price is not None:
         changes["status"] = "ok"
         changes["message"] = None
@@ -865,20 +928,113 @@ def login(body: AuthBody, _: None = Depends(limit_auth)):
     return _auth_payload(found)
 
 
+def _image_media(data: bytes) -> str | None:
+    if data.startswith(b"\xff\xd8\xff"):
+        return "image/jpeg"
+    if data.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "image/png"
+    if len(data) >= 12 and data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return "image/webp"
+    return None
+
+
+def _require_password(user: dict, password: str) -> None:
+    found = db.get_user_by_email(user["email"])
+    password_hash = None if found is None else found.get("password_hash")
+    if password_hash is None or not verify_password(password, password_hash):
+        raise HTTPException(401, "Senha atual incorreta.")
+
+
+@app.get("/api/me")
 @app.get("/api/auth/me")
 def me(user: dict = Depends(current_user)):
-    stored = db.get_user(user["id"])
-    if stored is None:
-        raise HTTPException(401, "Sessão inválida. Entre de novo.")
-    return stored
+    return _public_user(user)
 
 
+@app.patch("/api/me")
 @app.patch("/api/auth/me")
-def patch_me(body: AlertSetting, user: dict = Depends(current_user)):
-    stored = db.set_email_price_alerts(user["id"], body.email_price_alerts)
+def patch_me(body: ProfileBody, user: dict = Depends(current_user)):
+    sent = body.model_fields_set
+    stored = user
+    if "email_price_alerts" in sent and body.email_price_alerts is not None:
+        updated = db.set_email_price_alerts(user["id"], body.email_price_alerts)
+        if updated is None:
+            raise HTTPException(404, "Conta não encontrada.")
+        stored = updated
+    if "display_name" in sent:
+        raw = " ".join((body.display_name or "").split())
+        if len(raw) > 80:
+            raise HTTPException(400, "O nome pode ter no máximo 80 caracteres.")
+        updated = db.set_display_name(user["id"], raw or None)
+        if updated is None:
+            raise HTTPException(404, "Conta não encontrada.")
+        stored = updated
+    return _public_user(stored)
+
+
+@app.post("/api/me/email")
+def change_email(body: EmailChange, user: dict = Depends(current_user), _: None = Depends(limit_account)):
+    email = _clean_email(body.email)
+    _require_password(user, body.password or "")
+    if email == user["email"]:
+        raise HTTPException(400, "Esse já é o seu e-mail.")
+    try:
+        stored = db.set_user_email(user["id"], email)
+    except ValueError as exc:
+        raise HTTPException(409, str(exc)) from exc
     if stored is None:
         raise HTTPException(404, "Conta não encontrada.")
-    return stored
+    return _auth_payload(stored)
+
+
+@app.post("/api/me/password")
+def change_password(body: PasswordChange, user: dict = Depends(current_user), _: None = Depends(limit_account)):
+    _require_password(user, body.current_password or "")
+    new_password = _clean_password(body.new_password)
+    if verify_password(new_password, db.get_user_by_email(user["email"])["password_hash"]):
+        raise HTTPException(400, "Escolha uma senha diferente da atual.")
+    stored = db.replace_password(user["id"], hash_password(new_password))
+    if stored is None:
+        raise HTTPException(404, "Conta não encontrada.")
+    return _auth_payload(stored)
+
+
+@app.put("/api/me/avatar")
+async def put_avatar(request: Request, user: dict = Depends(current_user), _: None = Depends(limit_account)):
+    data = await request.body()
+    if len(data) > 1_000_000:
+        raise HTTPException(400, "A imagem precisa ter no máximo 1 MB.")
+    media = _image_media(data)
+    if media is None:
+        raise HTTPException(400, "Envie uma imagem JPEG, PNG ou WebP.")
+    stored = db.save_avatar(user["id"], data, media)
+    if stored is None:
+        raise HTTPException(404, "Conta não encontrada.")
+    return _public_user(stored)
+
+
+@app.delete("/api/me/avatar")
+def remove_avatar(user: dict = Depends(current_user), _: None = Depends(limit_account)):
+    db.delete_avatar(user["id"])
+    stored = db.get_user(user["id"])
+    if stored is None:
+        raise HTTPException(404, "Conta não encontrada.")
+    return _public_user(stored)
+
+
+@app.get("/api/users/{user_id}/avatar")
+def user_avatar(user_id: str, request: Request):
+    found = db.get_avatar(user_id)
+    if found is None:
+        raise HTTPException(404, "Foto não encontrada.")
+    tag = f'"{found["updated_at"]}"'
+    if request.headers.get("if-none-match") == tag:
+        return Response(status_code=304, headers={"ETag": tag, "Cache-Control": "public, max-age=86400"})
+    return Response(
+        content=found["content"],
+        media_type=found["media_type"],
+        headers={"ETag": tag, "Cache-Control": "public, max-age=86400"},
+    )
 
 
 @app.get("/api/notifications")
@@ -1318,7 +1474,7 @@ def member_reserve(item_id: str, body: ReserveBody, user: dict = Depends(current
     item = _access_item(item_id, user, "viewer")
     if item["reserved"]:
         raise HTTPException(409, "Alguém já marcou este item.")
-    label = " ".join((body.name or "").split())[:80] or db.person_label(user["email"])
+    label = " ".join((body.name or "").split())[:80] or db.person_label(user["email"], user.get("display_name"))
     updated = db.update_item(
         item_id,
         {
