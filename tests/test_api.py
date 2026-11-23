@@ -1039,3 +1039,51 @@ def test_profile_name_email_password_and_avatar(client, monkeypatch):
     assert removed.status_code == 200
     assert removed.json()["has_avatar"] is False
     assert client.get(f"/api/users/{user['id']}/avatar").status_code == 404
+
+
+def test_display_name_is_current_on_members_and_items(client, monkeypatch):
+    monkeypatch.setattr("app.main.extract_product", lambda url: Extracted(status="failed", final_url=url))
+    headers, _user = _auth(client, "cesaraugustow17@example.com")
+    listed = client.get("/api/lists", headers=headers).json()["lists"][0]
+    list_id = listed["id"]
+    owner = listed["members"][0]
+    assert owner["role"] == "owner"
+    assert owner["label"] == "Cesaraugustow17"
+    assert owner["initials"] == "CE"
+
+    renamed = client.patch("/api/me", json={"display_name": "César Willemberg"}, headers=headers)
+    assert renamed.status_code == 200, renamed.text
+    assert renamed.json()["display_name"] == "César Willemberg"
+
+    listed = client.get("/api/lists", headers=headers).json()["lists"][0]
+    assert listed["members"][0]["label"] == "César Willemberg"
+    assert listed["members"][0]["initials"] == "CW"
+    members = client.get(f"/api/lists/{list_id}/members", headers=headers).json()["members"]
+    assert members[0]["label"] == "César Willemberg"
+    assert members[0]["initials"] == "CW"
+    assert members[0]["role"] == "owner"
+
+    created = client.post(
+        f"/api/lists/{list_id}/items",
+        json={"name": "Copo", "url": "https://www.kabum.com.br/produto/1/copo"},
+        headers=headers,
+    )
+    assert created.status_code == 201, created.text
+    item_id = created.json()["id"]
+    assert created.json()["added_by_label"] == "César Willemberg"
+
+    again = client.patch("/api/me", json={"display_name": "César W"}, headers=headers)
+    assert again.status_code == 200
+    reserved = client.post(f"/api/items/{item_id}/reservation", json={}, headers=headers)
+    assert reserved.status_code == 200, reserved.text
+    assert reserved.json()["added_by_label"] == "César W"
+    assert reserved.json()["reserved_label"] == "César W"
+
+    client.patch("/api/me", json={"display_name": "César Willemberg"}, headers=headers)
+    shown = client.patch(f"/api/lists/{list_id}/settings", json={"show_reservations": True}, headers=headers)
+    assert shown.status_code == 200, shown.text
+    loaded = client.get(f"/api/lists/{list_id}/items", headers=headers).json()
+    assert loaded["list"]["members"][0]["label"] == "César Willemberg"
+    item = next(entry for entry in loaded["items"] if entry["id"] == item_id)
+    assert item["added_by_label"] == "César Willemberg"
+    assert item["reserved_label"] == "César Willemberg"

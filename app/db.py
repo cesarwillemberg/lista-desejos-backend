@@ -726,9 +726,11 @@ def _members_for(conn, list_ids: list[str]) -> dict[str, list[dict]]:
     marks, params = _marks(list_ids)
     rows = conn.execute(
         f"""
-        SELECT list_members.list_id, list_members.user_id, list_members.role, users.email
+        SELECT list_members.list_id, list_members.user_id, list_members.role,
+               users.email, users.display_name, avatars.updated_at AS avatar_at
         FROM list_members
         JOIN users ON users.id = list_members.user_id
+        LEFT JOIN user_avatars AS avatars ON avatars.user_id = users.id
         WHERE list_members.list_id IN ({marks})
         ORDER BY CASE list_members.role WHEN 'owner' THEN 0 WHEN 'editor' THEN 1 ELSE 2 END, users.email
         """,

@@ -193,11 +193,10 @@ def _web_base() -> str:
     return (os.environ.get("PUBLIC_WEB_BASE") or "https://cesarwillemberg.github.io/lista-desejos-frontend").rstrip("/")
 
 
-def _owner_label(email: str | None) -> str:
-    if not email or "@" not in email:
+def _owner_label(user: dict | None) -> str:
+    if not user:
         return "alguém"
-    name = email.split("@", 1)[0].replace(".", " ").replace("_", " ").strip()
-    return name[:1].upper() + name[1:] if name else "alguém"
+    return db.person_label(user.get("email"), user.get("display_name"))
 
 
 def _present_list(payload: dict, request: Request | None = None) -> dict:
@@ -261,6 +260,7 @@ def _present_item(
     reserved_by_id: str | None = None,
     reserved_by_has_avatar: bool = False,
     reserved_by_avatar_at: str | None = None,
+    resolved_reserved_label: str | None = None,
 ) -> dict:
     hidden = {"reserved_token_hash", "added_by", "reserved_by", "purchased_by"}
     if not owner:
@@ -289,6 +289,8 @@ def _present_item(
         data["reserved_by_has_avatar"] = reserved_by_has_avatar
         if reserved_by_avatar_at:
             data["reserved_by_avatar_at"] = reserved_by_avatar_at
+        if resolved_reserved_label:
+            data["reserved_label"] = resolved_reserved_label
     data.setdefault("priority", item.get("priority") or "quero")
     return data
 
@@ -319,6 +321,7 @@ def _present_items(items: list[dict], *, member: bool, user_id: str | None, clai
                 reserved_by_id=item.get("reserved_by") if member and reveal_reservations else None,
                 reserved_by_has_avatar=bool(reserved.get("has_avatar")),
                 reserved_by_avatar_at=reserved.get("avatar_at"),
+                resolved_reserved_label=reserved.get("label") if item.get("reserved_by") else None,
             )
         )
     return presented
@@ -836,7 +839,7 @@ def short_link(code: str, request: Request):
         return Response(page, status_code=404, media_type="text/html; charset=utf-8")
     public_id = found.get("short_code") or code
     target = f"{_web_base()}/#/l/{public_id}"
-    owner = _owner_label((db.get_user(found["user_id"]) or {}).get("email"))
+    owner = _owner_label(db.get_user(found["user_id"]))
     title = found["name"]
     description = f"Lista de {owner} no Wishly"
     image = ""
@@ -875,7 +878,7 @@ def invite_link(code: str, request: Request):
     role = found["invite_role"]
     role_label = "pode editar" if role == "editor" else "só pode ver"
     target = f"{_web_base()}/#/c/{code}"
-    owner = _owner_label((db.get_user(found["user_id"]) or {}).get("email"))
+    owner = _owner_label(db.get_user(found["user_id"]))
     title = found["name"]
     description = f"{owner} convidou você para esta lista. Você {role_label}."
     image = ""
