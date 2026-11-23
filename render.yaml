@@ -34,7 +34,7 @@ services:
       - key: JWT_SECRET
         generateValue: true
       - key: PUBLIC_WEB_BASE
-        value: https://cesarwillemberg.github.io/lista-desejos-frontend
+        value: https://cesarwillemberg.github.io/wishly-mobile
       - key: PUBLIC_SHORT_BASE
         value: https://lista-desejos-backend.onrender.com
       - key: ANDROID_PACKAGE

@@ -190,7 +190,7 @@ def _short_base(request: Request) -> str:
 
 
 def _web_base() -> str:
-    return (os.environ.get("PUBLIC_WEB_BASE") or "https://cesarwillemberg.github.io/lista-desejos-frontend").rstrip("/")
+    return (os.environ.get("PUBLIC_WEB_BASE") or "https://cesarwillemberg.github.io/wishly-mobile").rstrip("/")
 
 
 def _owner_label(user: dict | None) -> str:
