@@ -3,6 +3,7 @@ from pathlib import Path
 import pytest
 
 from app.extractor import (
+    BLOCKED_MESSAGE,
     PARSE_MESSAGE,
     clean_product_title,
     extract_html,
@@ -100,6 +101,38 @@ def test_americanas_jsonld_and_meta():
     assert result.price == 616.55
     assert result.currency == "BRL"
     assert result.image_url and "vtexassets.com" in result.image_url
+
+
+def test_amazon_captcha_page_is_a_block():
+    html = """
+    <html><body>
+      <p>Para continuar, confirme que você não é um robô.</p>
+      <form action="/errors/validateCaptcha"></form>
+      <a href="mailto:api-services-support@amazon.com">suporte</a>
+    </body></html>
+    """
+    result = extract_html(html, "https://www.amazon.com.br/dp/B0CHX1W1XY", status=200)
+    assert result.status == "failed"
+    assert result.message == BLOCKED_MESSAGE
+    assert result.price is None
+    assert result.image_url is None
+
+
+def test_amazon_503_stub_is_a_block():
+    html = '<html><script>window.location.replace("https://www.amazon.com.br/error/500");</script><body></body></html>'
+    result = extract_html(html, "https://www.amazon.com.br/dp/B0CHX1W1XY", status=503)
+    assert result.message == BLOCKED_MESSAGE
+    assert "http-503" in (result.scrape_error or "")
+
+
+def test_amazon_media_image_is_used_when_the_buy_box_is_missing():
+    html = """
+    <html><head><title>Fritadeira Philco | Amazon.com.br</title></head>
+    <body><img src="https://m.media-amazon.com/images/I/71example._AC_SL1500_.jpg"></body></html>
+    """
+    result = extract_html(html, "https://www.amazon.com.br/dp/B0EXAMPLE")
+    assert result.image_url.endswith("_AC_SL1500_.jpg")
+    assert result.message == PARSE_MESSAGE
 
 
 def test_amazon_buy_box_not_list_price():

@@ -455,6 +455,10 @@ def _classify(soup: BeautifulSoup | None, fetched: FetchResult) -> tuple[str, st
         return "network", fetched.error or "empty"
     if any(token in final for token in ("account-verification", "validatecaptcha", "captcha", "/gz/")):
         return "blocked", "challenge-url"
+    raw = (fetched.html or "").lower()
+    for token in ("api-services-support@amazon.com", "validatecaptcha", "opfcaptcha"):
+        if token in raw:
+            return "blocked", token
     visible = _visible_text(soup) if soup is not None else ""
     for token in (
         "access denied",
@@ -463,9 +467,13 @@ def _classify(soup: BeautifulSoup | None, fetched: FetchResult) -> tuple[str, st
         "robot check",
         "pardon our interruption",
         "verificação de acesso",
+        "digite os caracteres",
+        "type the characters you see",
     ):
         if token in visible:
             return "blocked", token
+    if fetched.html and "window.location.replace" in fetched.html and "/error/500" in fetched.html and len(fetched.html) < 2000:
+        return "blocked", "amazon-error-500"
     return "parse", "no-price"
 
 
@@ -657,6 +665,12 @@ def _apply_amazon(soup: BeautifulSoup, draft: _Draft) -> None:
                 except (json.JSONDecodeError, TypeError, ValueError):
                     chosen = None
         draft.set_image(chosen or image.get("src"), "html:amazon")
+    if draft.image is None:
+        for img in soup.select("img"):
+            src = img.get("src") or img.get("data-src") or ""
+            if "m.media-amazon.com/images/I/" in src or "media-amazon.com/images/I/" in src:
+                draft.set_image(src, "html:amazon")
+                break
 
 
 def _amazon_price_text(container) -> str | None:

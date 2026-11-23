@@ -115,18 +115,23 @@ def _log_fetch(url: str, result: FetchResult) -> FetchResult:
     return result
 
 
+def _amazon_host(url: str) -> bool:
+    host = (urlparse(url).hostname or "").lower()
+    return "amazon." in host
+
+
 def fetch_html(url: str, timeout: float = 10.0) -> FetchResult:
     ensure_public_url(url)
     primary: FetchResult | None = None
     try:
-        primary = _with_curl(url, timeout)
+        primary = _amazon_curl(url, timeout) if _amazon_host(url) else _with_curl(url, timeout)
     except ValueError:
         raise
     except TimeoutError:
         primary = FetchResult(False, url, url, None, "", "A página demorou demais para responder.", "curl_cffi")
     except Exception:
         logger.info("curl_cffi could not fetch %s", url)
-    if primary is not None and _worth_keeping(primary):
+    if primary is not None and _worth_keeping(primary) and not _looks_like_amazon_wall(primary.html):
         return _log_fetch(url, primary)
     try:
         secondary = _with_httpx(url, timeout)
@@ -209,16 +214,45 @@ def fetch_image(url: str, referer: str | None, timeout: float = 15.0) -> tuple[b
     return content, media
 
 
-def _with_curl(url: str, timeout: float) -> FetchResult:
+_AMAZON_PROFILES = ("chrome136", "chrome131", "safari18_0", "chrome131_android")
+
+
+def _looks_like_amazon_wall(html: str) -> bool:
+    low = (html or "").lower()
+    if "window.location.replace" in low and "/error/500" in low and len(low) < 2000:
+        return True
+    return any(token in low for token in ("validatecaptcha", "api-services-support@amazon.com", "opfcaptcha"))
+
+
+def _amazon_curl(url: str, timeout: float) -> FetchResult | None:
+    """Try a few TLS profiles. Amazon 503s are tiny, so the extra attempts stay cheap."""
+    best: FetchResult | None = None
+    language = {"Accept-Language": "pt-BR,pt;q=0.9,en;q=0.8"}
+    for profile in _AMAZON_PROFILES:
+        try:
+            result = _with_curl(url, timeout, profile=profile, headers=language)
+        except TimeoutError:
+            raise
+        except Exception:
+            logger.info("amazon profile %s failed for %s", profile, url)
+            continue
+        if _worth_keeping(result) and not _looks_like_amazon_wall(result.html):
+            return result
+        if best is None or len(result.html or "") > len(best.html or ""):
+            best = result
+    return best
+
+
+def _with_curl(url: str, timeout: float, profile: str = "chrome131", headers: dict[str, str] | None = None) -> FetchResult:
     from curl_cffi import requests as creq
 
     try:
         response = creq.get(
             url,
-            impersonate="chrome131",
+            impersonate=profile,
             timeout=timeout,
             allow_redirects=True,
-            headers=BROWSER_HEADERS,
+            headers=BROWSER_HEADERS if headers is None else headers,
         )
     except Exception as exc:
         if "timeout" in type(exc).__name__.lower() or "timed out" in str(exc).lower():

@@ -833,6 +833,41 @@ def test_notes_details_and_manual_order(client, monkeypatch):
     assert by_id[second]["priority"] == "talvez"
 
 
+def test_create_keeps_typed_price_and_details(client, monkeypatch):
+    monkeypatch.setattr(
+        "app.main.extract_product",
+        lambda url: Extracted(title="Da loja", price=50, currency="USD", status="ok", image_url="https://images.example.com/loja.jpg", final_url=url),
+    )
+    headers, _user = _auth(client, "detalhe@example.com")
+    list_id = client.get("/api/lists", headers=headers).json()["lists"][0]["id"]
+    created = client.post(
+        f"/api/lists/{list_id}/items",
+        json={
+            "url": "https://www.kabum.com.br/produto/9/caixa",
+            "priority": "muito",
+            "note": "azul marinho",
+            "color": "azul",
+            "size_label": "M",
+            "voltage": "220V",
+            "quantity": 2,
+            "price": 12.5,
+            "currency": "BRL",
+        },
+        headers=headers,
+    )
+    assert created.status_code == 201, created.text
+    body = _saved(client, headers, list_id, created.json()["id"])
+    assert body["name"] == "Da loja"
+    assert body["priority"] == "muito"
+    assert body["note"] == "azul marinho"
+    assert body["color"] == "azul"
+    assert body["size_label"] == "M"
+    assert body["voltage"] == "220V"
+    assert body["quantity"] == 2
+    assert body["price"] == 12.5
+    assert body["currency"] == "BRL"
+
+
 def test_extension_origin_is_allowed(client):
     response = client.get("/api/health", headers={"Origin": "chrome-extension://abcdefghijklmnop"})
     assert response.status_code == 200

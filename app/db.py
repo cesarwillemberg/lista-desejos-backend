@@ -843,8 +843,8 @@ def insert_item(list_id: str, fields: dict) -> dict:
             INSERT INTO items (
               id, list_id, category_id, name, url, image_url, price, currency, store, status, message,
               image_source, price_source, reserved_label, reserved_token_hash, reserved_at, reserved_by,
-              added_by, priority, position, note, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+              added_by, priority, position, note, color, size_label, voltage, quantity, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 item_id,
@@ -868,6 +868,10 @@ def insert_item(list_id: str, fields: dict) -> dict:
                 fields.get("priority") or "quero",
                 position,
                 fields.get("note"),
+                fields.get("color"),
+                fields.get("size_label"),
+                fields.get("voltage"),
+                fields.get("quantity"),
                 now,
                 now,
             ),

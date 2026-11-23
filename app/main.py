@@ -81,6 +81,13 @@ class ItemCreate(BaseModel):
     category_id: str | None = None
     priority: str | None = None
     note: str | None = None
+    color: str | None = None
+    size_label: str | None = None
+    voltage: str | None = None
+    quantity: int | None = None
+    price: float | None = None
+    currency: str | None = None
+    image_url: str | None = None
 
 
 class ItemUpdate(BaseModel):
@@ -477,6 +484,13 @@ def _apply_scrape(item_id: str, url: str, previous: dict | None, *, use_cache: b
                 _apply_scraped_name(changes, extracted, url, update_name=update_name)
         else:
             changes = _refresh_changes(extracted, url, previous)
+        current = db.get_item(item_id)
+        if current and current.get("price_source") == "manual":
+            for key in ("price", "currency", "price_source"):
+                changes.pop(key, None)
+        if current and current.get("image_source") == "manual" and current.get("image_url"):
+            changes.pop("image_url", None)
+            changes.pop("image_source", None)
         saved = db.update_item(item_id, changes)
         if saved and saved.get("price") is not None and ("price" in changes):
             _note_price_change(saved)
@@ -1146,6 +1160,18 @@ def create_item(list_id: str, body: ItemCreate, user: dict = Depends(current_use
     if len(url) > 2000:
         raise HTTPException(400, "Esse link é longo demais.")
     ensure_public_url(url)
+    manual_price = None
+    if body.price is not None:
+        if body.price < 0 or body.price > 100_000_000:
+            raise HTTPException(400, "Informe um preço válido.")
+        manual_price = round(float(body.price), 2)
+    image = (body.image_url or "").strip()
+    if image:
+        if len(image) > 2000:
+            raise HTTPException(400, "A URL da imagem é longa demais.")
+        ensure_public_url(image)
+    if body.quantity is not None and (body.quantity < 1 or body.quantity > 999):
+        raise HTTPException(400, "A quantidade precisa ficar entre 1 e 999.")
     item = db.insert_item(
         list_id,
         {
@@ -1158,6 +1184,15 @@ def create_item(list_id: str, body: ItemCreate, user: dict = Depends(current_use
             "message": "Lendo a página da loja…",
             "priority": body.priority if body.priority in {"muito", "quero", "talvez"} else "quero",
             "note": (body.note or "").strip()[:2000] or None,
+            "color": (body.color or "").strip()[:40] or None,
+            "size_label": (body.size_label or "").strip()[:40] or None,
+            "voltage": (body.voltage or "").strip()[:20] or None,
+            "quantity": body.quantity,
+            "price": manual_price,
+            "currency": _clean_currency(body.currency) if manual_price is not None else None,
+            "price_source": "manual" if manual_price is not None else None,
+            "image_url": image or None,
+            "image_source": "manual" if image else None,
         },
     )
     schedule_scrape(item["id"], url, update_name=not typed)
@@ -1206,7 +1241,7 @@ def patch_item(item_id: str, body: ItemUpdate, user: dict = Depends(current_user
     if "priority" in sent:
         priority = (body.priority or "").strip().lower()
         if priority not in {"muito", "quero", "talvez"}:
-            raise HTTPException(400, "Escolha muito quero, quero ou talvez.")
+            raise HTTPException(400, "Escolha quero muito, quero ou talvez.")
         changes["priority"] = priority
     if "position" in sent and body.position is not None:
         changes["position"] = body.position
@@ -1232,6 +1267,11 @@ def patch_item(item_id: str, body: ItemUpdate, user: dict = Depends(current_user
     content_changed = any(key in changes for key in ("image_url", "price", "currency"))
     image = changes["image_url"] if "image_url" in changes else current["image_url"]
     price = changes["price"] if "price" in changes else current["price"]
+    # Saving the form with the price and photo still empty must not replace a scrape message.
+    already_empty = current.get("price") is None and not (current.get("image_url") or "").strip()
+    still_empty = price is None and not (image or "")
+    if content_changed and already_empty and still_empty:
+        content_changed = False
     if content_changed and image and price is not None:
         changes["status"] = "ok"
         changes["message"] = None
